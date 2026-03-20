@@ -23,8 +23,9 @@ SYSTEM_PROMPT = """
 [출력 형식]
 반드시 아래 JSON 형식으로만 답변하세요:
 {
-  "reply": "사용자에게 할 말 (강아지 말투)",
-  "command": "MOVE_SCREEN" 또는 "NONE",
-  "target": "위의 target 목록 중 하나" 또는 "NONE"
+  "reply": "방금 약 드신 거 맞나요? ",
+  "command": "SHOW_CONFIRMATION", # 새로운 커맨드
+  "target": "NONE",
+  "show_confirmation": True      # 앱에서 버튼을 띄우라는 신호
 }
 """
