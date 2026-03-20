@@ -1,3 +1,4 @@
+import json
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from core.config import settings
@@ -7,32 +8,26 @@ def get_medie_response(user_message: str, current_mode: str):
     llm = AzureChatOpenAI(
         azure_endpoint=settings.azure_openai_endpoint,
         azure_deployment=settings.azure_openai_deployment_name,
-        api_version=settings.azure_openai_api_version, # <--- 여기도 azure_openai로 변경!
+        api_version=settings.azure_openai_api_version,
         api_key=settings.azure_openai_api_key,
-        temperature=0.7
+        temperature=0.3 # 판단의 정확도를 위해 온도를 낮춤
     )
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"현재 앱 화면: {current_mode}\n사용자 메시지: {user_message}")
+        HumanMessage(content=f"현재 화면: {current_mode}\n사용자: {user_message}")
     ]
 
     response = llm.invoke(messages)
-    content = response.content
-
-    # 단순 화면 전환 판단 (나중에 Tool 사용으로 업그레이드 가능)
-    target = "NONE"
-    command = "NONE"
     
-    if "MAP" in content or "지도" in content:
-        target = "MAP"
-        command = "MOVE_SCREEN"
-    elif "SCAN" in content or "사진" in content:
-        target = "SCAN"
-        command = "MOVE_SCREEN"
-
-    return {
-        "reply": content,
-        "command": command,
-        "target": target
-    }
+    try:
+        # LLM이 뱉은 JSON 문자열을 파싱
+        result = json.loads(response.content)
+        return result
+    except:
+        # 파싱 실패 시 대비 (폴백 로직)
+        return {
+            "reply": response.content,
+            "command": "NONE",
+            "target": "NONE"
+        }
