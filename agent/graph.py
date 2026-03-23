@@ -45,7 +45,7 @@ def monitor_iot_node(state: AgentState):
     print("\n[System] Azure IoT Storage 데이터 확인 중...")
 
     # 1. 연결 설정 (이미 설정된 환경변수나 문자열 사용), 여기서 조원의 settings를 최대한 활용하도록 재구성
-    conn_str = "DefaultEndpointsProtocol=https;AccountName=mediehubstorage;AccountKey=fC/v/zFg9TRtClKXxHktHPxof2VFQKJikNmHIT4xL3GxirXB6y5dAIbvaveKs9ckqoB/LHw89IsZ+ASt7eLaCg==;EndpointSuffix=core.windows.net"
+    conn_str = settings.azure_storage_connection_string
     container_name = "mediehubstoragecontainer"
 
     try:
