@@ -15,10 +15,10 @@ async def lifespan(app: FastAPI):
     yield
     print("👋 [System] 서버 종료 중...")
 
-fastapi_app = FastAPI(title="Medie AI Agent", lifespan=lifespan)
+app = FastAPI(title="Medie AI Agent", lifespan=lifespan)
 
 # CORS 설정 (React Native 연결 필수)
-fastapi_app.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -66,7 +66,7 @@ class ChatRequest(BaseModel):
     current_mode: str
     user_id: str = "User_01" # [추가] 유저 아이디 기본값
 
-@fastapi_app.post("/chat")
+@app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     """매디야~ 라고 불렀을 때 실행되는 메인 엔진"""
     try:
@@ -92,4 +92,4 @@ async def chat_endpoint(req: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
