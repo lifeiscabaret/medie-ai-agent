@@ -5,6 +5,11 @@ import time
 import requests
 from typing import TypedDict, Annotated, List, Union
 from datetime import datetime
+import json
+from json import JSONDecoder
+
+# Pydantic 로드 (데이터 검증의 핵심)
+from pydantic import BaseModel, Field, ValidationError
 
 # 라이브러리 로드
 from langchain_openai import AzureChatOpenAI
@@ -15,7 +20,31 @@ from azure.storage.blob import BlobServiceClient
 from core.config import settings
 from agent.prompts import SYSTEM_PROMPT
 
-# 1. 에이전트 상태(State) 정의
+# =========================================================
+# 1. Pydantic 스키마 정의 (정교한 데이터 규격화)
+# =========================================================
+class MedicationData(BaseModel):
+    """IoT 기기에서 들어오는 입력 데이터의 규격 (Input Schema)"""
+    device_id: str = Field(default="Unknown", alias="deviceId", description="기기 고유 ID")
+    timestamp: str = Field(description="데이터 측정 시간 (한국 시간 KST)")
+    morning: bool = Field(default=False, description="아침 복용 완료 여부")
+    lunch: bool = Field(default=False, description="점심 복용 완료 여부")
+    evening: bool = Field(default=False, description="저녁 복용 완료 여부")
+    bedtime: bool = Field(default=False, description="취침 전 복용 완료 여부")
+    action: str = Field(default="NONE", description="최신 기기 동작 (TAKEN, REFILLED, OPENED 등)")
+    weight_change: float = Field(default=0.0, description="약 무게 변화량(g) - 반드시 숫자형")
+    rssi: int = Field(default=0, description="WiFi 신호 세기")
+    pill_status: str = Field(default="UNKNOWN", description="약통 상태 (EMPTY, LOADED 등)")
+
+class AgentResponse(BaseModel):
+    """매디(LLM)가 반드시 대답해야 하는 출력 규격 (Output Schema)"""
+    reply: str = Field(description="매디가 사용자에게 전송할 친절하고 강아지 같은 응답 텍스트")
+    command: str = Field(description="앱 프론트엔드에게 보낼 구체적인 제어 신호 (예: 'NONE', 'SHOW_CONFIRMATION_POPUP')")
+    target: str = Field(description="현재 에이전트가 판단한 다음 논리 단계 (예: 'IDLE', 'WAIT_FOR_CONFIRM')")
+
+# =========================================================
+# 2. 에이전트 상태(State) 정의
+# =========================================================
 class AgentState(TypedDict):
     """매디의 두뇌 역할을 하는 상태 저장소입니다."""
     user_id: str             # 사용자 고유 식별자 (예: "User_01")
@@ -28,7 +57,9 @@ class AgentState(TypedDict):
     messages: Annotated[List[str], "대화 로그"]    # LLM과의 전체 대화 이력 (LangGraph의 기억 저장소)
     user_confirmed: bool     # 복약 확정 상태 (Human-in-the-Loop 결과), 사용자가 앱에서 [예]를 눌렀는지 여부
 
-# 2. 모델 설정 (조원의 Settings 활용으로 보안 강화)
+# =========================================================
+# 3. 모델 설정 (조원의 Settings 활용으로 보안 강화)
+# =========================================================
 llm = AzureChatOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     azure_deployment=settings.azure_openai_deployment_name,
@@ -37,11 +68,14 @@ llm = AzureChatOpenAI(
     temperature=0.3 # 판단의 정확도를 위해 온도를 낮춤
 )
 
-# ---------------------------------------------------------
-# 3. 노드 함수 정의 (빌드업 핵심)
-# ---------------------------------------------------------
+# LLM이 무조건 AgentResponse 스키마 형태로만 대답하도록 강제 (Pydantic을 활용한 혁신적인 기능!)
+structured_llm = llm.with_structured_output(AgentResponse)
+
+# =========================================================
+# 4. 노드 함수 정의 (빌드업 핵심)
+# =========================================================
 def monitor_iot_node(state: AgentState):
-    """[Node 1] Azure Storage에서 최신 IoT 데이터를 가져와 디코딩"""
+    """[Node 1] Azure Storage에서 최신 IoT 데이터를 가져와 로드하고 디코딩 & Pydantic 검증"""
     print("\n[System] Azure IoT Storage 데이터 확인 중...")
 
     # 1. 연결 설정 (이미 설정된 환경변수나 문자열 사용), 여기서 조원의 settings를 최대한 활용하도록 재구성
@@ -72,9 +106,6 @@ def monitor_iot_node(state: AgentState):
             # 파일에 JSON이 여러 개 붙어 있을 경우, 첫 번째 것만 가져오기 위해 처리
             # (만약 모든 데이터를 보려면 split('}{') 등의 로직이 필요하지만, 
             #  최신 데이터 하나만 보는 게 목적이라면 아래 방식이 안전
-            import json
-            from json import JSONDecoder
-
             decoder = JSONDecoder()
             # 첫 번째 유효한 JSON 객체만 뽑아냅니다.
             raw_content, index = decoder.raw_decode(content_str)
@@ -98,24 +129,35 @@ def monitor_iot_node(state: AgentState):
             else:
                 print(f" -> [확인] 기기 전송 타임스탬프 사용: {decoded_json['timestamp']}")
 
-            # 터미널에서 복약 상태 확인
-            m = "O" if decoded_json.get("morning") else "X"
-            l = "O" if decoded_json.get("lunch") else "X"
-            e = "O" if decoded_json.get("evening") else "X"
-            b = "O" if decoded_json.get("bedtime") else "X"
-        
-            print(f" -> [성공] 최신 감지된 무게 변화:: {decoded_json.get('weight_change')}g")
-            print(f" -> [상태] 아침:{m} | 점심:{l} | 저녁:{e} | 취침:{b}")
+            # ✨ [핵심] Pydantic을 이용한 데이터 검증 및 정제
+            try:
+                # 불순물이 섞인 JSON을 MedicationData 틀에 넣어서 예쁘게 찍어냅니다.
+                validated_data = MedicationData(**decoded_json)
+                clean_dict = validated_data.model_dump() # 다시 딕셔너리로 변환
 
-            # 5. 상태(State) 업데이트 후 반환
-            return {
-                **state,
-                "iot_status": decoded_json,
-                "device_id": decoded_json.get("deviceId", "Unknown")
-            }
+                # 터미널에서 복약 상태 확인
+                m = "O" if clean_dict['morning'] else "X"
+                l = "O" if clean_dict['lunch'] else "X"
+                e = "O" if clean_dict['evening'] else "X"
+                b = "O" if clean_dict['bedtime'] else "X"
+                
+                print(f" -> [검증 성공] Pydantic 필터링 완료")
+                print(f" -> [성공] 최신 감지된 무게 변화: {clean_dict['weight_change']}g")
+                print(f" -> [상태] 아침:{m} | 점심:{l} | 저녁:{e} | 취침:{b}")
+
+                # 5. 상태(State) 업데이트 후 반환
+                return {
+                    **state,
+                    "iot_status": clean_dict,
+                    "device_id": clean_dict['device_id']
+                }
+            except ValidationError as val_err:
+                print(f"(!) [데이터 규격 오류] IoT 데이터가 Pydantic 스키마와 맞지 않습니다: {val_err}")
+                # 에러가 나도 프로그램이 죽지 않고 빈 상태로 넘김
+                return state
         else:
             print("(!) 파일은 찾았으나 Body 데이터가 비어있습니다.")
-            return state
+            return state        
 
     except Exception as err:
         # 연결 문자열이 틀렸거나 네트워크 문제일 경우 실행됨
@@ -130,39 +172,44 @@ def analyze_schedule_node(state: AgentState):
     return {**state, "schedule": [{"pill_name": "비타민", "time": "13:00", "is_taken": False}]}
 
 def maddy_reasoning_node(state: AgentState):
-    """[Node 3] 매디의 최종 추론 (조원의 프롬프트 활용)"""
+    """[Node 3] 매디의 최종 추론 (조원의 프롬프트 활용) + (Pydantic Structured Output 적용 업데이트)"""
     print("[System Log] 매디가 생각 중...")
 
     # 프롬프트에 형식을 강하게 지시
-    format_instruction = "\n\nJSON 형식으로만 대답해: {'reply': '...', 'command': '...', 'target': '...'}"
-    
+    # format_instruction = "\n\nJSON 형식으로만 대답해: {'reply': '...', 'command': '...', 'target': '...'}"
     # 조원이 작성한 SYSTEM_PROMPT를 사용하여 일관성 유지
+    # messages = [
+    #    SystemMessage(content=SYSTEM_PROMPT + format_instruction),
+    #    HumanMessage(content=f"현재 모드: {state.get('next_step')}\n데이터: {state['iot_status']}\n대화기록: {state['messages']}")
+    #]
+    # 26/03/24/15:24 Pydantic 추가로 JSON 형식으로 대답해달라고 할 필요가 없어짐. 그래서 주석처리함
+
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT + format_instruction),
+        SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=f"현재 모드: {state.get('next_step')}\n데이터: {state['iot_status']}\n대화기록: {state['messages']}")
     ]
-
-    response = llm.invoke(messages)
-    content = response.content.strip()
-
-    # 가끔 AI가 ```json ... ``` 이렇게 마크다운을 섞어줄 때를 대비한 안전장치
-    if "```json" in content:
-        content = content.split("```json")[1].split("```")[0].strip()
-
+    
     try:
-        # 조원이 의도한 JSON 형식으로 파싱 시도
-        ai_res = json.loads(response.content)
-        print(f" -> [매디 응답]: {ai_res.get('reply')}")
+        # ✨ [핵심] 일반 llm.invoke() 대신 structured_llm.invoke() 사용!
+        # 응답이 단순 텍스트가 아니라, AgentResponse 객체(클래스)로 곧바로 나옵니다.
+        ai_res = structured_llm.invoke(messages)
+        
+        print(f" -> [매디 응답]: {ai_res.reply}")
         return {
             **state,
-            "response_text": ai_res.get("reply", "멍! 무슨 일인가멍?"),
-            "action_required": ai_res.get("command", "NONE"),
-            "next_step": ai_res.get("target", "IDLE")
+            "response_text": ai_res.reply,
+            "action_required": ai_res.command,
+            "next_step": ai_res.target
         }
-    except:
-        # JSON 파싱 실패하더라도 최소한의 JSON 구조는 유지해서 반환
-        print(" -> [주의] JSON 파싱 실패!")
-        return {**state, "response_text": response.content, "next_step": "IDLE"}
+    except Exception as e:
+        # LLM이 구조를 못 맞추거나 네트워크 오류가 났을 때의 대비책
+        print(f" -> [주의] LLM 추론 또는 구조화 실패! 에러: {e}")
+        return {
+            **state, 
+            "response_text": "멍! 지금은 조금 헷갈린다멍. 잠시 후에 다시 말해달라멍!", 
+            "action_required": "NONE", # 에러시 기본값 명시
+            "next_step": "IDLE"
+        }
 
 # ---------------------------------------------------------
 # 4. 그래프 구성 및 컴파일
@@ -180,7 +227,7 @@ workflow.add_edge("maddy_reasoning", END)
 
 # 최종 앱 객체
 app = workflow.compile()
-print("Maddy Agent 빌드 완료!")
+print("Maddy Agent 빌드 완료! (Pydantic 탑재)")
 
 # ---------------------------------------------------------
 # 6. 외부 전송 함수 (DB 연동용)
@@ -190,19 +237,19 @@ def send_to_joone_fastapi(state: AgentState):
     분석된 결과를 DB FastAPI 서버 주소로 POST 전송합니다.
     """
     # 조원이 알려줄 실제 서버 주소로 수정 필요 (예: http://1.2.3.4:8000/api/pill-check)
-    JOONE_API_URL = "https://medichubs-backend.azurewebsites.net/Arduino" 
+    JOONE_API_URL = "http://20.106.40.121/arduino"
 
-    # 조원 서버가 받기 편한 형태로 데이터 가공
+    # 아두이노에서 온 데이터를 조원 서버가 받기 편한 형태로 데이터 가공
     payload = {
         "user_id": state["user_id"],
         "device_id": state["device_id"],
-        "morning": state["iot_status"].get("morning"),  # 아두이노에서 온 데이터
+        "morning": state["iot_status"].get("morning"),  
         "lunch": state["iot_status"].get("lunch"),
         "evening": state["iot_status"].get("evening"),
         "bedtime": state["iot_status"].get("bedtime"),
         "maddy_message": state["response_text"],
         "action_required": state["action_required"],
-        "weight_change": state["iot_status"].get("weight_change", 0),
+        "weight_change": state["iot_status"].get("weight_change", 0.00),
         "is_taken": state["user_confirmed"]
     }
 

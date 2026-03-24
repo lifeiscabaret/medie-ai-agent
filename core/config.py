@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     azure_openai_api_version: str  
     
     # 🔴 아래 두 줄을 꼭 추가해 주세요! (에러 로그에서 찾던 이름들입니다)
+    azure_storage_connection_string: str
     cosmos_connection_string: str
     jwt_secret_key: str
 
