@@ -52,19 +52,48 @@ class AgentResponse(BaseModel):
     reply: str = Field(description="매디가 사용자에게 전송할 친절하고 강아지 같은 응답 텍스트")
     command: str = Field(description="앱 프론트엔드에게 보낼 구체적인 제어 신호 (예: 'NONE', 'SHOW_CONFIRMATION_POPUP')")
     target: str = Field(description="현재 에이전트가 판단한 다음 논리 단계 (예: 'IDLE', 'WAIT_FOR_CONFIRM')")
+    # ✨ 추가: AI가 분석한 맞춤형 다음 알람 시간
+    next_alarm_time: str = Field(
+        default="", 
+        description="ISO 형식의 다음 알람 시간 (예: 2026-03-25T18:30:00). 필요 없으면 빈 문자열."
+    )
 
+class BackendPayload(BaseModel):
+    """조원(FastAPI) 서버가 요구하는 최종 데이터 규격"""
+    user_id: str
+    device_id: str
+    morning: bool
+    lunch: bool
+    evening: bool
+    bedtime: bool
+    weight_change: float
+    is_taken: bool
+    maddy_message: str
+    action_required: str = Field(default="NONE", description="앱 제어 명령")
+    next_alarm_time: str # ✨ 앱 푸시용 시간
+    
+    model_config = {"populate_by_name": True}
 # =========================================================
 # 2. 에이전트 상태(State) 정의
 # =========================================================
 class AgentState(TypedDict):
-    """매디의 두뇌 역할을 하는 상태 저장소입니다."""
+    """
+    매디의 두뇌 역할을 하는 상태 저장소(State)입니다.
+    모든 노드(Node)는 이 정보를 공유하며 업데이트합니다.
+    """
+    # 1. 사용자 및 기기 식별
     user_id: str             # 사용자 고유 식별자 (예: "User_01")
     device_id: str           # NodeMCU 기기 ID (예: "NodeMCU_01")
+    # 2. 데이터 소스 (Input)
     iot_status: dict         # 실시간 IoT 실시간 데이터 (기기에서 넘어온 생생한 정보), 구성: {"weight_change": 10.06, "timestamp": "2026-03-20 11:23:03", "rssi": -63, ...} 복약정보도 추가
     schedule: List[dict]     # 복약 스케줄 정보 (DB에서 읽어온 오늘의 목표), 구성: [{"pill_name": "비타민", "dosage_time": "13:00", "is_taken": False}, ...]
-    next_step: str           # 에이전트 추론 및 제어 필드 (LLM이 결정하는 부분), 현재 에이전트가 판단한 다음 논리 단계 (예: "IDLE", "SEND_PUSH", "WAIT_FOR_CONFIRM", "RECORD_SUCCESS")
-    action_required: str     # 앱 프론트엔드에게 보낼 구체적인 제어 신호 (예: "SHOW_CONFIRMATION_POPUP", "PLAY_DOG_BARK")
-    response_text: str       # 대화 및 인터랙션 (사용자와의 소통 기록), 매디가 사용자에게 전송할 친절한 응답 텍스트
+    # 3. 에이전트 추론 결과 (Output)
+    next_step: str           # [LLM 결정] 에이전트 추론 및 제어 필드, 현재 에이전트가 판단한 다음 논리 단계 (예: "IDLE", "SEND_PUSH", "WAIT_FOR_CONFIRM", "RECORD_SUCCESS")
+    action_required: str     # [LLM 결정] 앱 프론트엔드에게 보낼 구체적인 제어 신호 (예: "SHOW_CONFIRMATION_POPUP", "PLAY_DOG_BARK")
+    response_text: str       # [LLM 결정] 대화 및 인터랙션 (사용자와의 소통 기록), 매디가 사용자에게 전송할 친절한 응답 텍스트
+    next_alarm_time: str     # [LLM 결정] 사용자 패턴 분석을 통한 AI의 맞춤형 다음 복용 권장 시간 (ISO 8601 형식)
+    
+    # 4. 기억 및 상태 기록
     messages: Annotated[List[str], "대화 로그"]    # LLM과의 전체 대화 이력 (LangGraph의 기억 저장소)
     user_confirmed: bool     # 복약 확정 상태 (Human-in-the-Loop 결과), 사용자가 앱에서 [예]를 눌렀는지 여부
 
@@ -204,13 +233,14 @@ def maddy_reasoning_node(state: AgentState):
         # ✨ [핵심] 일반 llm.invoke() 대신 structured_llm.invoke() 사용!
         # 응답이 단순 텍스트가 아니라, AgentResponse 객체(클래스)로 곧바로 나옵니다.
         ai_res = structured_llm.invoke(messages)
-        
         print(f" -> [매디 응답]: {ai_res.reply}")
+
         return {
             **state,
             "response_text": ai_res.reply,
             "action_required": ai_res.command,
-            "next_step": ai_res.target
+            "next_step": ai_res.target,
+            "next_alarm_time": ai_res.next_alarm_time  # ✨ 이 줄이 있어야 시간이 전달됩니다!
         }
     except Exception as e:
         # LLM이 구조를 못 맞추거나 네트워크 오류가 났을 때의 대비책
@@ -241,45 +271,56 @@ app = workflow.compile()
 print("Maddy Agent 빌드 완료! (Pydantic 탑재)")
 
 # ---------------------------------------------------------
-# 6. 외부 전송 함수 (DB 연동용)
+# 6. 외부 전송 함수 (DB 연동용), 분석된 결과를 DB FastAPI 서버 주소로 POST 전송합니다.
 # ---------------------------------------------------------
 def send_to_joone_fastapi(state: AgentState):
-    """
-    분석된 결과를 DB FastAPI 서버 주소로 POST 전송합니다.
-    """
-    # 조원이 알려줄 실제 서버 주소로 수정 필요 (예: http://1.2.3.4:8000/api/pill-check)
+    # 조원이 알려준 실제 서버 주소
     JOONE_API_URL = "http://20.106.40.121/arduino"
 
+    # ✨ Pydantic 모델을 사용하여 데이터 조립 및 검증
     iot = state["iot_status"]
-    # 아두이노에서 온 데이터를 조원 서버가 받기 편한 형태로 데이터 가공
-    payload = {
-        "user_id": state["user_id"],
-        "deviceId": state["device_id"], 
-        "morning": iot.get("morning", False),
-        "lunch": iot.get("lunch", False),
-        "evening": iot.get("evening", False),
-        "bedtime": iot.get("bedtime", False),
-        "action": iot.get("action", "NONE"),
-        "pill_status": iot.get("pill_status", "UNKNOWN"),
-        "weight_change": iot.get("weight_change", 0.00),
-        "timestamp": iot.get("timestamp", ""),
-        "rssi": iot.get("rssi", 0),
-        "epoch": iot.get("epoch"),
-        "zone": iot.get("zone"),
-        "free_heap": iot.get("free_heap"),
-    }
 
     try:
-        print(f"[Maddy] 조원 서버로 데이터 전송 중... ({JOONE_API_URL})")
-        response = requests.post(JOONE_API_URL, json=payload, timeout=5)
-        
+        # [Step 1] Pydantic 모델에 데이터 주입 (자동 검증)
+        # 여기서 형식이 틀리면 바로 ValidationError가 발생하여 try-except로 빠집니다.
+        # 아두이노에서 온 데이터를 조원 서버가 받기 편한 형태로 데이터 가공 및 에이전트의 메세지, 복약시간 추가
+        payload_data = BackendPayload(
+            user_id=state.get("user_id", "Unknown"),
+            device_id=state.get("device_id", "Unknown"),
+            morning=iot.get("morning", False),
+            lunch=iot.get("lunch", False),
+            evening=iot.get("evening", False),
+            bedtime=iot.get("bedtime", False),
+            weight_change=float(iot.get("weight_change", 0.0)), # 안전하게 float 형변환
+            is_taken=state.get("user_confirmed", False),
+            maddy_message=state.get("response_text", ""),
+            action_required=state.get("action_required", "NONE"),
+            next_alarm_time=state.get("next_alarm_time", "") # AI가 계산한 맞춤형 시간
+        )
+        print(f"[Maddy] DB 서버로 데이터 전송 중... ({JOONE_API_URL})")
+
+        # model_dump()를 사용하여 Pydantic 객체를 JSON용 딕셔너리로 변환
+        response = requests.post(
+            JOONE_API_URL, 
+            json=payload_data.model_dump(), 
+            timeout=5
+        )
         if response.status_code == 200:
-            print(f"✅ [전송 성공] 조원 서버 응답: {response.json()}")
+            print(f"✅ [전송 성공] DB 서버 응답: {response.json()}")
         else:
-            print(f"❌ [전송 실패] 상태 코드: {response.status_code}")
-            
+            print(f"❌ [전송 실패] 상태 코드: {response.status_code} | 내용: {response.text}")
+
+    except ValidationError as val_err:
+        # 우리가 정의한 BackendPayload 규격에 맞지 않을 때
+        print(f"⚠️ [데이터 규격 위반] DB 서버로 보낼 데이터가 유효하지 않습니다:\n{val_err}")
+        
+    except requests.exceptions.RequestException as req_err:
+        # 네트워크 연결 자체에 문제가 있을 때
+        print(f"(!) [네트워크 오류] DB 서버에 연결할 수 없습니다: {req_err}")
+        
     except Exception as err:
-        print(f"(!) 조원 서버 연결 오류: {err}")
+        # 그 외 예상치 못한 모든 에러
+        print(f"(!) [시스템 오류] 전송 중 알 수 없는 문제가 발생했습니다: {err}")
 
 # ---------------------------------------------------------
 # 6. 조원의 main.py가 호출할 인터페이스 함수
@@ -305,9 +346,9 @@ def get_medie_response(user_message: str, current_mode: str):
     # 앱에 응답을 주기 전에 서버에도 이 내용을 알려줘야 DB에 기록됩니다!
     try:
         send_to_joone_fastapi(final_result)
-        print("✅ [Sync] 조원 서버에 분석 데이터 전송 완료")
+        print("✅ [Sync] DB 서버에 분석 데이터 전송 완료")
     except Exception as err:
-        print(f"⚠️ [Sync] 조원 서버 전송 실패 (무시하고 진행): {err}")
+        print(f"⚠️ [Sync] DB 서버 전송 실패 (무시하고 진행): {err}")
     
     # 4. 조원이 요구한 형태(reply, command, target)로 최종 반환
     # 이 값은 main.py의 FastAPI를 통해 앱 화면에 바로 뜹니다.

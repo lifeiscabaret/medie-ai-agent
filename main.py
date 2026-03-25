@@ -48,11 +48,11 @@ async def trigger_agent(data: MedicationData): # 2. graph.py에서 가져온 스
     # 4. 루프 기다리지 않고 즉시 실행!
     final_result = app.invoke(event_state)
     
-    # 5. 결과가 나오면 조원 서버로 바로 쏘기
+    # 5. 결과가 나오면 DB 서버로 바로 쏘도록 구현
     if final_result["next_step"] != "IDLE":
         send_to_joone_fastapi(final_result)
 
-    return {"status": "success", "msg": "즉각 분석 완료"}
+    return {"status": "success", "msg": "무게 분석 완료"}
 
 
 # 앱에서 보낼 요청 형식
