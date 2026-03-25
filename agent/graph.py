@@ -336,6 +336,7 @@ def get_medie_response(user_message: str, current_mode: str):
         "next_step": current_mode,
         "action_required": "NONE",
         "response_text": "",
+        "next_alarm_time": "",
         "messages": [user_message],
         "user_confirmed": False
     }
@@ -347,6 +348,11 @@ def get_medie_response(user_message: str, current_mode: str):
     try:
         send_to_joone_fastapi(final_result)
         print("✅ [Sync] DB 서버에 분석 데이터 전송 완료")
+        # 2. ✨ 실시간 앱 푸시 발송 (새로 추가!)
+        # 다음 알람 시간이 계산되었거나, 즉시 알림이 필요한 경우에만 실행
+        if final_result.get("next_alarm_time") or final_result.get("action_required") != "NONE":
+            send_push_notification(final_result)
+            print("✅ [Sync] DB 서버에 실시간 푸시 데이터 전송 완료")
     except Exception as err:
         print(f"⚠️ [Sync] DB 서버 전송 실패 (무시하고 진행): {err}")
     
@@ -355,5 +361,38 @@ def get_medie_response(user_message: str, current_mode: str):
     return {
         "reply": final_result["response_text"],
         "command": final_result["action_required"],
-        "target": final_result["next_step"]
+        "target": final_result["next_step"],
+        "next_alarm_time": final_result.get("next_alarm_time", "")
     }
+# ---------------------------------------------------------
+# 6. 앱 푸시 전송 함수
+# ---------------------------------------------------------
+
+def send_push_notification(state: AgentState):
+    """
+    사용자의 스마트폰으로 직접 앱 푸시 알림을 요청합니다.
+    (조원님의 푸시 전용 서버 엔드포인트 호출)
+    """
+    # 💡 조원님이 알려줄 푸시 전용 API 주소 (예시)
+    PUSH_API_URL = "http://20.106.40.121/push/send" 
+    
+    # 알림 내용 조립
+    push_payload = {
+        "user_id": state["user_id"],
+        "title": "🐾 매디의 복약 조언",
+        "body": state["response_text"],  # "7시에 약 드시는 거 잊지 마세요!"
+        "scheduled_time": state.get("next_alarm_time", ""), # 예약 발송용
+        "priority": "high"
+    }
+
+    try:
+        print(f"📢 [Push] 앱 푸시 발송 요청 중...")
+        response = requests.post(PUSH_API_URL, json=push_payload, timeout=3)
+        
+        if response.status_code == 200:
+            print("✅ [Push 성공] 사용자 휴대폰으로 알림이 전송되었습니다.")
+        else:
+            print(f"⚠️ [Push 실패] 상태 코드: {response.status_code}")
+            
+    except Exception as err:
+        print(f"(!) [Push 오류] 알림 서버 연결 불가: {err}")
