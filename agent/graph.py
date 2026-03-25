@@ -24,7 +24,7 @@ from agent.prompts import SYSTEM_PROMPT
 # 1. Pydantic 스키마 정의 (정교한 데이터 규격화)
 # =========================================================
 class MedicationData(BaseModel):
-    """IoT 기기에서 들어오는 입력 데이터의 규격 (Input Schema)"""
+    """IoT 기기에서 들어오는 입력 데이터의 규격 (Input Schema)을 파이썬 변수로 매핑"""
     # 아두이노 key값과 파이썬 변수명이 다를 경우 alias 지정
     device_id: str = Field(default="Unknown", alias="deviceId", description="기기 고유 ID")
     timestamp: str = Field(description="데이터 측정 시간 (한국 시간 KST)")
@@ -264,7 +264,9 @@ def send_to_joone_fastapi(state: AgentState):
         "weight_change": iot.get("weight_change", 0.00),
         "timestamp": iot.get("timestamp", ""),
         "rssi": iot.get("rssi", 0),
-        "is_taken": state["user_confirmed"]
+        "epoch": iot.get("epoch"),
+        "zone": iot.get("zone"),
+        "free_heap": iot.get("free_heap"),
     }
 
     try:
