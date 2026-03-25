@@ -25,16 +25,27 @@ from agent.prompts import SYSTEM_PROMPT
 # =========================================================
 class MedicationData(BaseModel):
     """IoT 기기에서 들어오는 입력 데이터의 규격 (Input Schema)"""
+    # 아두이노 key값과 파이썬 변수명이 다를 경우 alias 지정
     device_id: str = Field(default="Unknown", alias="deviceId", description="기기 고유 ID")
     timestamp: str = Field(description="데이터 측정 시간 (한국 시간 KST)")
     morning: bool = Field(default=False, description="아침 복용 완료 여부")
     lunch: bool = Field(default=False, description="점심 복용 완료 여부")
     evening: bool = Field(default=False, description="저녁 복용 완료 여부")
     bedtime: bool = Field(default=False, description="취침 전 복용 완료 여부")
-    action: str = Field(default="NONE", description="최신 기기 동작 (TAKEN, REFILLED, OPENED 등)")
-    weight_change: float = Field(default=0.0, description="약 무게 변화량(g) - 반드시 숫자형")
-    rssi: int = Field(default=0, description="WiFi 신호 세기")
+    action: str = Field(default="NONE", description="최신 기기 동작 상태 측정값 (TAKEN, REFILLED 등)")
     pill_status: str = Field(default="UNKNOWN", description="약통 상태 (EMPTY, LOADED 등)")
+    weight_change: float = Field(default=0.0, description="약 무게 변화량(g) - 반드시 숫자형")
+
+    # 아두이노 시스템 메타데이터
+    rssi: int = Field(default=0, description="WiFi 신호 세기")
+    epoch: int = Field(default=0, description="유닉스 타임스탬프")
+    zone: int = Field(default=1, description="로드셀 윗판")
+    free_heap: int = Field(default=0, alias="free_heap", description="아두이노 남은 메모리 용량")
+
+    model_config = {
+        "populate_by_name": True, # alias와 변수명 둘 다 인식 가능하게 함
+        "extra": "ignore"         # 정의되지 않은 다른 필드가 들어와도 에러 내지 않고 무시
+    }
 
 class AgentResponse(BaseModel):
     """매디(LLM)가 반드시 대답해야 하는 출력 규격 (Output Schema)"""
@@ -239,17 +250,20 @@ def send_to_joone_fastapi(state: AgentState):
     # 조원이 알려줄 실제 서버 주소로 수정 필요 (예: http://1.2.3.4:8000/api/pill-check)
     JOONE_API_URL = "http://20.106.40.121/arduino"
 
+    iot = state["iot_status"]
     # 아두이노에서 온 데이터를 조원 서버가 받기 편한 형태로 데이터 가공
     payload = {
         "user_id": state["user_id"],
-        "device_id": state["device_id"],
-        "morning": state["iot_status"].get("morning"),  
-        "lunch": state["iot_status"].get("lunch"),
-        "evening": state["iot_status"].get("evening"),
-        "bedtime": state["iot_status"].get("bedtime"),
-        "maddy_message": state["response_text"],
-        "action_required": state["action_required"],
-        "weight_change": state["iot_status"].get("weight_change", 0.00),
+        "deviceId": state["device_id"], 
+        "morning": iot.get("morning", False),
+        "lunch": iot.get("lunch", False),
+        "evening": iot.get("evening", False),
+        "bedtime": iot.get("bedtime", False),
+        "action": iot.get("action", "NONE"),
+        "pill_status": iot.get("pill_status", "UNKNOWN"),
+        "weight_change": iot.get("weight_change", 0.00),
+        "timestamp": iot.get("timestamp", ""),
+        "rssi": iot.get("rssi", 0),
         "is_taken": state["user_confirmed"]
     }
 
