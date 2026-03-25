@@ -5,11 +5,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent.graph import app as medie_graph, get_medie_response, send_to_joone_fastapi
+from agent.graph import app as medie_graph, get_medie_response, send_to_joone_fastapi, MedicationData
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 서버 시작 시 모니터링 스레드 실행
     monitor_thread = threading.Thread(target=background_monitoring, daemon=True)
     monitor_thread.start()
     yield
@@ -17,7 +16,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Medie AI Agent", lifespan=lifespan)
 
-# CORS 설정 (React Native 연결 필수)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,7 +25,7 @@ app.add_middleware(
 )
 
 def background_monitoring():
-    print("🚀 [System] 실시간 IoT 확인 스레드가 시작되었습니다.")
+    print("🚀 [System] 실시간 IoT 확인 스레드 시작")
     last_processed_time = ""
 
     initial_state = {
@@ -35,19 +33,19 @@ def background_monitoring():
         "device_id": "Unknown",
         "iot_status": {},
         "schedule": [],
+        "intent": "CHAT",
         "next_step": "IDLE",
         "action_required": "NONE",
         "response_text": "",
         "messages": [],
-        "user_confirmed": False
+        "user_confirmed": False,
+        "show_confirmation": False,
+        "params": {}
     }
 
     while True:
         try:
-            # 수정: app -> medie_graph
             final_state = medie_graph.invoke(initial_state)
-            
-            # iot_status가 dict가 아닐 경우를 대비한 안전장치
             iot_data = final_state.get("iot_status", {})
             current_time = iot_data.get("timestamp", "") if isinstance(iot_data, dict) else ""
 
@@ -57,38 +55,67 @@ def background_monitoring():
                     send_to_joone_fastapi(final_state)
                 last_processed_time = current_time
         except Exception as err:
-            print(f"⚠️ [Background Error] 확인 중 오류 발생: {err}")
-        
+            print(f"⚠️ [Background Error]: {err}")
+
         time.sleep(30)
+
 
 class ChatRequest(BaseModel):
     message: str
     current_mode: str
-    user_id: str = "User_01" # [추가] 유저 아이디 기본값
+    user_id: str = "User_01"
+
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
-    """매디야~ 라고 불렀을 때 실행되는 메인 엔진"""
+    """매디 챗 엔드포인트"""
     try:
-        # get_medie_response가 딕셔너리를 반환하는지, Pydantic 객체를 반환하는지 확인 필요
         result = get_medie_response(req.message, req.current_mode)
-        
-        # 객체일 경우를 대비해 안전하게 처리
-        if hasattr(result, "dict"): # Pydantic v1
-            res_dict = result.dict()
-        elif hasattr(result, "model_dump"): # Pydantic v2
-            res_dict = result.model_dump()
-        else:
-            res_dict = result # 이미 dict인 경우
-
         return {
-            "reply": res_dict.get("response_text") or res_dict.get("reply"),
-            "command": res_dict.get("action_required") or res_dict.get("command"),
-            "target": res_dict.get("next_step") or res_dict.get("target")
+            "reply": result.get("reply"),
+            "command": result.get("command"),
+            "target": result.get("target"),
+            "show_confirmation": result.get("show_confirmation", False),
+            "params": result.get("params", {})
         }
     except Exception as e:
         print(f"❌ [Chat Error] {e}")
-        return {"reply": "멍! 대답하기가 조금 힘들다멍...", "command": "NONE", "target": "IDLE"}
+        return {
+            "reply": "멍! 대답하기가 조금 힘들다멍...",
+            "command": "NONE",
+            "target": "IDLE",
+            "show_confirmation": False,
+            "params": {}
+        }
+
+
+@app.post("/webhook/weight-log")
+async def webhook_weight_log(data: MedicationData):
+    """IoT 즉각 감지 Webhook"""
+    print(f"🔔 [Webhook] 즉각 감지! 기기: {data.device_id}")
+
+    event_state = {
+        "user_id": "SYSTEM_TRIGGER",
+        "device_id": data.device_id,
+        "iot_status": data.model_dump(),
+        "schedule": [],
+        "intent": "IOT_EVENT",
+        "next_step": "ANALYZING",
+        "action_required": "NONE",
+        "response_text": "",
+        "messages": [],
+        "user_confirmed": False,
+        "show_confirmation": False,
+        "params": {}
+    }
+
+    final_result = medie_graph.invoke(event_state)
+
+    if final_result.get("next_step") != "IDLE":
+        send_to_joone_fastapi(final_result)
+
+    return {"status": "success", "msg": "무게 분석 완료"}
+
 
 if __name__ == "__main__":
     import uvicorn
