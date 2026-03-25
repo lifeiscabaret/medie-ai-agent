@@ -189,23 +189,35 @@ def analyze_schedule_node(state: AgentState):
 
 
 def classify_intent_node(state: AgentState):
-    """[Node 3] 사용자 의도 분류 - 핵심 분기점!"""
     print("[System] 사용자 의도 분류 중...")
 
     user_message = state["messages"][-1] if state["messages"] else ""
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
 
-    # IoT 이벤트 우선 체크
+    # ✅ IoT 이벤트 - 무게 변화 + 5분 이내 데이터만 처리
     if abs(weight_change) > 1.0:
-        print(f" -> [IoT 감지] 무게 변화: {weight_change}g → IOT_EVENT")
-        return {**state, "intent": "IOT_EVENT"}
+        timestamp_str = iot_data.get("timestamp", "")
+        is_recent = False
+        try:
+            iot_time = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+            diff = (datetime.now() - iot_time).total_seconds()
+            is_recent = diff < 300  # 5분 이내
+        except:
+            is_recent = False
 
+        if is_recent:
+            print(f" -> [IoT 감지] 최근 데이터! 무게 변화: {weight_change}g → IOT_EVENT")
+            return {**state, "intent": "IOT_EVENT"}
+        else:
+            print(f" -> [IoT 무시] 오래된 데이터 ({timestamp_str}), 사용자 메시지로 처리")
+
+    # LLM으로 의도 분류
     classify_messages = [
         SystemMessage(content="""
 사용자 메시지를 보고 의도를 분류하세요.
 - NAVIGATE: 화면 이동 요청 (약국 찾아줘, 스캔해줘, 내 약 보여줘 등)
-- COMPLETE_DOSE: 복약 완료 (약 먹었어, 복용했어, 먹었다 등)
+- COMPLETE_DOSE: 복약 완료 (약 먹었어, 복용했어, 먹었다, 응 먹었어 등)
 - SET_ALARM: 알람 시간 변경 (8시로 바꿔줘, 알람 설정해줘 등)
 - IOT_EVENT: IoT 기기 관련
 - CHAT: 그 외 일반 대화, 약 정보 질문 등
