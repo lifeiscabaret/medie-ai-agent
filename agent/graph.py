@@ -17,9 +17,10 @@ from core.config import settings
 from agent.prompts import SYSTEM_PROMPT
 
 
+# =========================================================
 # 1. Pydantic 스키마 정의
+# =========================================================
 class MedicationData(BaseModel):
-    """IoT 기기에서 들어오는 입력 데이터 규격"""
     device_id: str = Field(default="Unknown", alias="deviceId")
     timestamp: str = Field(default="")
     morning: bool = Field(default=False)
@@ -41,24 +42,32 @@ class MedicationData(BaseModel):
 
 
 class IntentClassification(BaseModel):
-    """1차 의도 분류"""
     intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "CHAT"] = Field(
         description="사용자 의도 분류"
     )
     reason: str = Field(description="분류 이유")
 
 
+# ✅ params 전용 모델 (additionalProperties: false 역할)
+class AlarmParams(BaseModel):
+    time: str = Field(default="")
+    pillId: str = Field(default="all")
+    taken_at: str = Field(default="")
+    weight_change: float = Field(default=0.0)
+    detected_at: str = Field(default="")
+
+    model_config = {"extra": "forbid"}
+
+
 class AgentResponse(BaseModel):
-    """LLM 출력 규격"""
     reply: str = Field(description="매디 응답 텍스트")
     command: str = Field(description="앱 제어 신호")
     target: str = Field(description="이동할 화면")
     show_confirmation: bool = Field(default=False)
-    params: dict = Field(default={})
+    params: AlarmParams = Field(default_factory=AlarmParams)
 
 
 class BackendPayload(BaseModel):
-    """DB 서버로 전송할 데이터 규격"""
     user_id: str
     device_id: str
     morning: bool
@@ -73,7 +82,9 @@ class BackendPayload(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# =========================================================
 # 2. 에이전트 상태 정의
+# =========================================================
 class AgentState(TypedDict):
     user_id: str
     device_id: str
@@ -89,17 +100,29 @@ class AgentState(TypedDict):
     params: dict
 
 
+# =========================================================
 # 3. 모델 설정
+# =========================================================
 llm = AzureChatOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     azure_deployment=settings.azure_openai_deployment_name,
     api_version=settings.azure_openai_api_version,
     api_key=settings.azure_openai_api_key,
-    temperature=0.3
+    temperature=0.3,
+    max_tokens=500,
 )
 
 structured_llm = llm.with_structured_output(AgentResponse)
-intent_llm = llm.with_structured_output(IntentClassification)
+
+# ✅ 의도 분류용 별도 LLM (토큰 절약)
+intent_llm = AzureChatOpenAI(
+    azure_endpoint=settings.azure_openai_endpoint,
+    azure_deployment=settings.azure_openai_deployment_name,
+    api_version=settings.azure_openai_api_version,
+    api_key=settings.azure_openai_api_key,
+    temperature=0.1,
+    max_tokens=50,
+).with_structured_output(IntentClassification)
 
 
 # =========================================================
@@ -129,17 +152,17 @@ async def update_user_profile(user_id: str, data: dict):
     pass
 
 
+# =========================================================
 # 5. 노드 함수 정의
+# =========================================================
 def monitor_iot_node(state: AgentState):
     user_message = state["messages"][0] if state["messages"] else ""
-    
-    # 실제 사용자 메시지가 있으면 IoT 로드 스킵
+
     if user_message and user_message.strip():
         print("[System] 사용자 메시지 감지 → IoT 로드 스킵")
         return state
-    
-    print("\n[System] Azure IoT Storage 데이터 확인 중...")
 
+    print("\n[System] Azure IoT Storage 데이터 확인 중...")
     conn_str = settings.azure_storage_connection_string
     container_name = "mediehubstoragecontainer"
 
@@ -189,7 +212,6 @@ def monitor_iot_node(state: AgentState):
 
 
 def analyze_schedule_node(state: AgentState):
-    """[Node 2] 복약 스케줄 대조"""
     print("[System] 복약 스케줄 확인 중...")
     return {**state, "schedule": [{"pill_name": "비타민", "time": "13:00", "is_taken": False}]}
 
@@ -201,14 +223,13 @@ def classify_intent_node(state: AgentState):
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
 
-    # ✅ IoT 이벤트 - 무게 변화 + 5분 이내 데이터만 처리
     if abs(weight_change) > 1.0:
         timestamp_str = iot_data.get("timestamp", "")
         is_recent = False
         try:
             iot_time = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
             diff = (datetime.now() - iot_time).total_seconds()
-            is_recent = diff < 300  # 5분 이내
+            is_recent = diff < 300
         except:
             is_recent = False
 
@@ -216,18 +237,15 @@ def classify_intent_node(state: AgentState):
             print(f" -> [IoT 감지] 최근 데이터! 무게 변화: {weight_change}g → IOT_EVENT")
             return {**state, "intent": "IOT_EVENT"}
         else:
-            print(f" -> [IoT 무시] 오래된 데이터 ({timestamp_str}), 사용자 메시지로 처리")
+            print(f" -> [IoT 무시] 오래된 데이터 ({timestamp_str})")
 
-    # LLM으로 의도 분류
     classify_messages = [
-        SystemMessage(content="""
-사용자 메시지를 보고 의도를 분류하세요.
+        SystemMessage(content="""사용자 메시지를 보고 의도를 분류하세요.
 - NAVIGATE: 화면 이동 요청 (약국 찾아줘, 스캔해줘, 내 약 보여줘 등)
 - COMPLETE_DOSE: 복약 완료 (약 먹었어, 복용했어, 먹었다, 응 먹었어 등)
 - SET_ALARM: 알람 시간 변경 (8시로 바꿔줘, 알람 설정해줘 등)
 - IOT_EVENT: IoT 기기 관련
-- CHAT: 그 외 일반 대화, 약 정보 질문 등
-"""),
+- CHAT: 그 외 일반 대화, 약 정보 질문 등"""),
         HumanMessage(content=f"사용자 메시지: {user_message}")
     ]
 
@@ -241,7 +259,6 @@ def classify_intent_node(state: AgentState):
 
 
 def navigate_node(state: AgentState):
-    """[Node 4] 화면 이동 처리"""
     print("[System] 화면 이동 처리 중...")
 
     messages = [
@@ -263,20 +280,17 @@ def navigate_node(state: AgentState):
         print(f"(!) navigate_node 실패: {e}")
         return {
             **state,
-            "response_text": "화면 이동할게요! 멍!",
-            "action_required": "NAVIGATE",
-            "next_step": "HOME",
+            "response_text": "죄송해요, 다시 말씀해주세요! 멍!",
+            "action_required": "NONE",
+            "next_step": "NONE",
             "show_confirmation": False,
             "params": {}
         }
 
 
 def complete_dose_node(state: AgentState):
-    """[Node 5] 복약 완료 처리"""
     print("[System] 복약 완료 처리 중...")
-
     taken_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    # TODO: await save_medication_log(state["user_id"], taken_at, "복용약")
 
     return {
         **state,
@@ -289,16 +303,13 @@ def complete_dose_node(state: AgentState):
 
 
 def set_alarm_node(state: AgentState):
-    """[Node 6] 알람 시간 변경 처리"""
     print("[System] 알람 시간 변경 처리 중...")
 
     messages = [
-        SystemMessage(content="""
-사용자가 알람 시간을 변경하고 싶어합니다.
+        SystemMessage(content="""사용자가 알람 시간을 변경하고 싶어합니다.
 메시지에서 시간을 추출해서 HH:MM 형식으로 변환하세요.
 예: "8시" → "08:00", "오후 3시 반" → "15:30"
-반드시 params에 time과 pillId를 포함하세요. pillId는 "all"로 설정하세요.
-"""),
+반드시 params에 time과 pillId를 포함하세요. pillId는 "all"로 설정하세요."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
 
@@ -310,7 +321,7 @@ def set_alarm_node(state: AgentState):
             "action_required": "SET_ALARM",
             "next_step": "ALARM",
             "show_confirmation": False,
-            "params": ai_res.params
+            "params": ai_res.params.model_dump()  # ✅ model_dump() 추가
         }
     except Exception as e:
         print(f"(!) set_alarm_node 실패: {e}")
@@ -325,9 +336,7 @@ def set_alarm_node(state: AgentState):
 
 
 def iot_action_node(state: AgentState):
-    """[Node 7] IoT 이벤트 처리 - 자동 복약 감지"""
     print("[System] IoT 이벤트 처리 중...")
-
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
     print(f" -> 무게 변화 감지: {weight_change}g → 복약 확인 팝업 표시")
@@ -346,7 +355,6 @@ def iot_action_node(state: AgentState):
 
 
 def chat_node(state: AgentState):
-    """[Node 8] 일반 대화 처리"""
     print("[System] 일반 대화 처리 중...")
 
     messages = [
@@ -363,7 +371,7 @@ def chat_node(state: AgentState):
             "action_required": ai_res.command,
             "next_step": ai_res.target,
             "show_confirmation": ai_res.show_confirmation,
-            "params": ai_res.params
+            "params": ai_res.params.model_dump()  # ✅ model_dump() 추가
         }
     except Exception as e:
         print(f"(!) chat_node 실패: {e}")
@@ -377,8 +385,9 @@ def chat_node(state: AgentState):
         }
 
 
-
+# =========================================================
 # 6. 라우팅 함수
+# =========================================================
 def route_by_intent(state: AgentState) -> str:
     intent = state.get("intent", "CHAT")
     print(f"[Router] 의도: {intent} → 해당 노드로 이동")
@@ -393,7 +402,9 @@ def route_by_intent(state: AgentState) -> str:
     return routes.get(intent, "chat")
 
 
+# =========================================================
 # 7. 그래프 구성 및 컴파일
+# =========================================================
 workflow = StateGraph(AgentState)
 
 workflow.add_node("monitor_iot", monitor_iot_node)
@@ -431,9 +442,10 @@ app = workflow.compile()
 print("✅ Maddy Agent 빌드 완료! (LangGraph 분기 탑재)")
 
 
+# =========================================================
 # 8. 외부 전송 함수
+# =========================================================
 def send_to_joone_fastapi(state: AgentState):
-    """DB FastAPI 서버로 POST 전송 - Pydantic 검증 포함"""
     JOONE_API_URL = "http://20.106.40.121/arduino"
     iot = state.get("iot_status", {})
 
@@ -468,18 +480,14 @@ def send_to_joone_fastapi(state: AgentState):
 
 
 def send_push_notification(user_id: str, title: str, body: str):
-    """앱 푸시 알림 전송 - TODO: 조원 API 연결 후 활성화"""
     PUSH_API_URL = "http://20.106.40.121/push/send"
-
     push_payload = {
         "user_id": user_id,
         "title": title,
         "body": body,
         "priority": "high"
     }
-
     try:
-        print(f"📢 [Push] 앱 푸시 발송 요청 중...")
         response = requests.post(PUSH_API_URL, json=push_payload, timeout=3)
         if response.status_code == 200:
             print("✅ [Push 성공]")
@@ -489,9 +497,10 @@ def send_push_notification(user_id: str, title: str, body: str):
         print(f"(!) [Push 오류]: {err}")
 
 
+# =========================================================
 # 9. 메인 인터페이스 함수
+# =========================================================
 def get_medie_response(user_message: str, current_mode: str):
-    """main.py가 호출하는 입구"""
     initial_state = {
         "user_id": "User_01",
         "device_id": "Unknown",
