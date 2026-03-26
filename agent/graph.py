@@ -4,7 +4,6 @@ import base64
 import time
 import requests
 from typing import TypedDict, Annotated, List, Literal
-from datetime import datetime
 from json import JSONDecoder
 
 from pydantic import BaseModel, Field, ValidationError
@@ -12,6 +11,7 @@ from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from azure.storage.blob import BlobServiceClient
+from datetime import datetime, timedelta, timezone
 
 from core.config import settings
 from agent.prompts import SYSTEM_PROMPT
@@ -158,8 +158,8 @@ async def update_user_profile(user_id: str, data: dict):
 # 5. 노드 함수 정의
 # =========================================================
 def monitor_iot_node(state: AgentState):
+    """[Node 1] Azure Storage에서 오늘치 IoT 데이터를 모두 가져와 복약 상태를 합산"""
     user_message = state["messages"][0] if state["messages"] else ""
-
     if user_message and user_message.strip():
         print("[System] 사용자 메시지 감지 → IoT 로드 스킵")
         return state
@@ -172,44 +172,112 @@ def monitor_iot_node(state: AgentState):
         blob_service_client = BlobServiceClient.from_connection_string(conn_str)
         container_client = blob_service_client.get_container_client(container_name)
 
+        # ✅ KST 기준 새벽 4시 복약 기준일 계산
+        kst = timezone(timedelta(hours=9))
+        now = datetime.now(kst)
+        if now.hour < 4:
+            start_time = now.replace(hour=4, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        else:
+            start_time = now.replace(hour=4, minute=0, second=0, microsecond=0)
+
+        print(f" -> 집계 시작 시점: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
         blobs = list(container_client.list_blobs())
-        if not blobs:
-            print("(!) 저장된 데이터 없음")
+
+        # ✅ 시작 시간 이후 파일만 필터링
+        relevant_blobs = [
+            b for b in blobs
+            if b.last_modified.astimezone(kst) >= start_time
+        ]
+
+        if not relevant_blobs:
+            print("(!) 해당 기준 시간 이후 저장된 데이터가 없습니다.")
             return {**state, "iot_status": {}}
 
-        latest_blob = sorted(blobs, key=lambda x: x.last_modified, reverse=True)[0]
-        file_time_str = latest_blob.last_modified.strftime('%Y-%m-%d %H:%M:%S')
+        # ✅ 합산할 기본 상태 초기화
+        aggregated_status = {
+            "morning": False,
+            "lunch": False,
+            "evening": False,
+            "bedtime": False,
+            "weight_change": 0.0,
+            "deviceId": "Unknown",
+            "timestamp": ""
+        }
 
-        blob_client = container_client.get_blob_client(latest_blob)
-        content_str = blob_client.download_blob().readall().decode('utf-8')
-
-        try:
-            decoder = JSONDecoder()
-            raw_content, _ = decoder.raw_decode(content_str)
-        except json.JSONDecodeError:
-            raw_content = json.loads(content_str)
-
-        encoded_body = raw_content.get("Body", "")
-        if encoded_body:
-            decoded_bytes = base64.b64decode(encoded_body)
-            decoded_json = json.loads(decoded_bytes)
-
-            if not decoded_json.get("timestamp"):
-                decoded_json["timestamp"] = file_time_str
-
+        # ✅ 시간순 정렬 후 순차 처리
+        for blob_info in sorted(relevant_blobs, key=lambda x: x.last_modified):
             try:
-                validated_data = MedicationData(**decoded_json)
-                clean_dict = validated_data.model_dump()
-                print(f" -> [검증 성공] 무게변화: {clean_dict['weight_change']}g")
-                return {**state, "iot_status": clean_dict, "device_id": clean_dict['device_id']}
-            except ValidationError as e:
-                print(f"(!) Pydantic 검증 실패: {e}")
-                return state
-        else:
+                blob_client = container_client.get_blob_client(blob_info)
+                content_str = blob_client.download_blob().readall().decode('utf-8')
+
+                try:
+                    decoder = JSONDecoder()
+                    raw_content, _ = decoder.raw_decode(content_str)
+                except json.JSONDecodeError:
+                    raw_content = json.loads(content_str)
+
+                encoded_body = raw_content.get("Body", "")
+                if not encoded_body:
+                    continue
+
+                # ✅ Body 타입 분기 처리
+                if isinstance(encoded_body, dict):
+                    decoded_json = encoded_body
+                elif isinstance(encoded_body, str):
+                    decoded_bytes = base64.b64decode(encoded_body)
+                    decoded_json = json.loads(decoded_bytes)
+                else:
+                    print(f"(!) 예상치 못한 Body 타입: {type(encoded_body)}")
+                    continue
+
+                # ✅ 핵심 합산 로직 (하나라도 True면 오늘 먹은 것)
+                if decoded_json.get("morning"): aggregated_status["morning"] = True
+                if decoded_json.get("lunch"): aggregated_status["lunch"] = True
+                if decoded_json.get("evening"): aggregated_status["evening"] = True
+                if decoded_json.get("bedtime"): aggregated_status["bedtime"] = True
+
+                # 최신 메타데이터 갱신
+                aggregated_status["weight_change"] = decoded_json.get("weight_change", 0.0)
+                aggregated_status["deviceId"] = decoded_json.get("deviceId", "Unknown")
+
+                file_time = blob_info.last_modified.astimezone(kst).strftime('%Y-%m-%d %H:%M:%S')
+                aggregated_status["timestamp"] = decoded_json.get("timestamp") or file_time
+
+                print(f" -> [로그 분석] {file_time} 파일 처리 완료")
+
+            except Exception as err:
+                print(f" -> [경고] 파일 해석 중 오류(무시): {err}")
+                continue
+
+        # ✅ 루프 끝난 후 aggregated_status로 Pydantic 검증
+        try:
+            validated_data = MedicationData(**aggregated_status)
+            clean_dict = validated_data.model_dump()
+
+            m = "O" if clean_dict['morning'] else "X"
+            l = "O" if clean_dict['lunch'] else "X"
+            e = "O" if clean_dict['evening'] else "X"
+            b = "O" if clean_dict['bedtime'] else "X"
+
+            print(f"\n[Maddy Summary] --- 4시 기준 오늘치 합산 결과 ---")
+            print(f" 📅 기준 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 이후")
+            print(f" 💊 복약 현황: 아침({m}) 점심({l}) 저녁({e}) 취침전({b})")
+            print(f" ⚖️ 최신 감지된 무게 변화: {clean_dict['weight_change']}g")
+            print(f" 🕒 최종 업데이트: {clean_dict['timestamp']}")
+            print(f"----------------------------------------------\n")
+
+            return {
+                **state,
+                "iot_status": clean_dict,
+                "device_id": clean_dict['device_id']
+            }
+        except ValidationError as val_err:
+            print(f"(!) Pydantic 검증 오류: {val_err}")
             return state
 
     except Exception as err:
-        print(f"(!) IoT 데이터 로드 실패: {err}")
+        print(f"(!) 데이터 로드 중 오류 발생: {err}")
         return state
 
 
