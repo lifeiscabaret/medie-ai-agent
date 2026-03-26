@@ -8,3 +8,4 @@ langchain
 langgraph
 langchain-openai
 httpx
+azure-storage-blob
