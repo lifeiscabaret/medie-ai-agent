@@ -68,6 +68,10 @@ class ChatRequest(BaseModel):
     current_mode: str
     user_id: str = "User_01"
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
