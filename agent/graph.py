@@ -131,7 +131,11 @@ async def update_user_profile(user_id: str, data: dict):
 
 # 5. 노드 함수 정의
 def monitor_iot_node(state: AgentState):
-    """[Node 1] Azure Storage에서 최신 IoT 데이터 로드"""
+    # 사용자 채팅 요청일 때는 IoT 로드 스킵
+    if state["messages"] and state["messages"][0]:
+        print("[System] 사용자 메시지 감지 → IoT 로드 스킵")
+        return state  # ← 바로 다음 노드로
+    
     print("\n[System] Azure IoT Storage 데이터 확인 중...")
 
     conn_str = settings.azure_storage_connection_string
