@@ -365,6 +365,7 @@ def chat_node(state: AgentState):
     try:
         ai_res = structured_llm.invoke(messages)
         print(f" -> [매디 응답]: {ai_res.reply}")
+
         return {
             **state,
             "response_text": ai_res.reply,

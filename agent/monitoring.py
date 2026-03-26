@@ -13,7 +13,12 @@ def start_monitoring():
     initial_state = {
         "user_id": "User_01",
         "device_id": "Unknown",
-        "iot_status": {},
+        # ✨ 스키마 항목을 기본값으로 꽉 채워줍니다!
+        "iot_status": {
+            "morning": False, "lunch": False, "evening": False, "bedtime": False,
+            "action": "NONE", "pill_status": "UNKNOWN", "weight_change": 0.0,
+            "timestamp": "", "rssi": 0, "epoch": 0, "zone": 1, "free_heap": 0
+        },
         "schedule": [],
         "next_step": "IDLE",
         "action_required": "NONE",
