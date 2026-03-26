@@ -42,19 +42,22 @@ class MedicationData(BaseModel):
 
 
 class IntentClassification(BaseModel):
-    intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "CHAT"] = Field(
+    intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST", "CHAT"] = Field(
         description="사용자 의도 분류"
     )
     reason: str = Field(description="분류 이유")
 
 
-# ✅ params 전용 모델 (additionalProperties: false 역할)
 class AlarmParams(BaseModel):
     time: str = Field(default="")
     pillId: str = Field(default="all")
     taken_at: str = Field(default="")
     weight_change: float = Field(default=0.0)
     detected_at: str = Field(default="")
+    keyword: str = Field(default="")
+    title: str = Field(default="")
+    content: str = Field(default="")
+    board_type: str = Field(default="free")
 
     model_config = {"extra": "forbid"}
 
@@ -114,7 +117,6 @@ llm = AzureChatOpenAI(
 
 structured_llm = llm.with_structured_output(AgentResponse)
 
-# ✅ 의도 분류용 별도 LLM (토큰 절약)
 intent_llm = AzureChatOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     azure_deployment=settings.azure_openai_deployment_name,
@@ -245,6 +247,8 @@ def classify_intent_node(state: AgentState):
 - COMPLETE_DOSE: 복약 완료 (약 먹었어, 복용했어, 먹었다, 응 먹었어 등)
 - SET_ALARM: 알람 시간 변경 (8시로 바꿔줘, 알람 설정해줘 등)
 - IOT_EVENT: IoT 기기 관련
+- SEARCH_DRUG: 약 검색 (타이레놀 찾아줘, OO약 검색해줘 등)
+- WRITE_POST: 게시글 작성 (후기 써줘, 게시판에 올려줘 등)
 - CHAT: 그 외 일반 대화, 약 정보 질문 등"""),
         HumanMessage(content=f"사용자 메시지: {user_message}")
     ]
@@ -280,7 +284,7 @@ def navigate_node(state: AgentState):
         print(f"(!) navigate_node 실패: {e}")
         return {
             **state,
-            "response_text": "죄송해요, 다시 말씀해주세요! 멍!",
+            "response_text": "죄송해요, 다시 말씀해주세요!",
             "action_required": "NONE",
             "next_step": "NONE",
             "show_confirmation": False,
@@ -294,7 +298,7 @@ def complete_dose_node(state: AgentState):
 
     return {
         **state,
-        "response_text": "복용 완료로 기록했어요! 건강을 위해 잘 챙겨드시는 주인님 최고예요! 멍멍!",
+        "response_text": "복용 완료로 기록했어요! 건강 잘 챙기고 있네요 😊",
         "action_required": "COMPLETE_DOSE",
         "next_step": "NONE",
         "show_confirmation": False,
@@ -321,13 +325,13 @@ def set_alarm_node(state: AgentState):
             "action_required": "SET_ALARM",
             "next_step": "ALARM",
             "show_confirmation": False,
-            "params": ai_res.params.model_dump()  # ✅ model_dump() 추가
+            "params": ai_res.params.model_dump()
         }
     except Exception as e:
         print(f"(!) set_alarm_node 실패: {e}")
         return {
             **state,
-            "response_text": "알람 시간을 말씀해주세요! 멍!",
+            "response_text": "알람 시간을 말씀해주세요!",
             "action_required": "NONE",
             "next_step": "NONE",
             "show_confirmation": False,
@@ -343,7 +347,7 @@ def iot_action_node(state: AgentState):
 
     return {
         **state,
-        "response_text": "약통에서 움직임이 감지됐어요! 방금 약 드셨나요? 멍멍!",
+        "response_text": "약통에서 움직임이 감지됐어요! 방금 약 드셨나요?",
         "action_required": "SHOW_CONFIRMATION",
         "next_step": "NONE",
         "show_confirmation": True,
@@ -352,6 +356,74 @@ def iot_action_node(state: AgentState):
             "detected_at": iot_data.get("timestamp", "")
         }
     }
+
+
+def search_drug_node(state: AgentState):
+    """[Node 9] 약 검색 실행"""
+    print("[System] 약 검색 처리 중...")
+
+    messages = [
+        SystemMessage(content="""사용자가 약을 검색하고 싶어합니다.
+메시지에서 약 이름을 추출해서 keyword로 설정하세요.
+예: "타이레놀 검색해줘" → params.keyword = "타이레놀" """),
+        HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
+    ]
+
+    try:
+        ai_res = structured_llm.invoke(messages)
+        return {
+            **state,
+            "response_text": ai_res.reply,
+            "action_required": "SEARCH_DRUG",
+            "next_step": "SEARCH_PILL",
+            "show_confirmation": False,
+            "params": ai_res.params.model_dump()
+        }
+    except Exception as e:
+        print(f"(!) search_drug_node 실패: {e}")
+        return {
+            **state,
+            "response_text": "검색할 약 이름을 말씀해주세요!",
+            "action_required": "NONE",
+            "next_step": "NONE",
+            "show_confirmation": False,
+            "params": {}
+        }
+
+
+def write_post_node(state: AgentState):
+    """[Node 10] 게시글 작성"""
+    print("[System] 게시글 작성 처리 중...")
+
+    messages = [
+        SystemMessage(content="""사용자가 게시글을 작성하고 싶어합니다.
+사용자 말에서 제목, 내용, 게시판 종류를 추출하세요.
+board_type: free(자유), question(복약질문), review(복용후기)
+자연스럽고 완성도 있는 게시글 형태로 작성해주세요.
+params에 title, content, board_type을 반드시 포함하세요."""),
+        HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
+    ]
+
+    try:
+        ai_res = structured_llm.invoke(messages)
+        return {
+            **state,
+            "response_text": ai_res.reply,
+            "action_required": "WRITE_POST",
+            "next_step": "WRITE_BOARD",
+            "show_confirmation": True,
+            "params": ai_res.params.model_dump()
+        }
+    except Exception as e:
+        print(f"(!) write_post_node 실패: {e}")
+        return {
+            **state,
+            "response_text": "게시글 내용을 말씀해주세요!",
+            "action_required": "NONE",
+            "next_step": "NONE",
+            "show_confirmation": False,
+            "params": {}
+        }
 
 
 def chat_node(state: AgentState):
@@ -372,13 +444,13 @@ def chat_node(state: AgentState):
             "action_required": ai_res.command,
             "next_step": ai_res.target,
             "show_confirmation": ai_res.show_confirmation,
-            "params": ai_res.params.model_dump()  # ✅ model_dump() 추가
+            "params": ai_res.params.model_dump()
         }
     except Exception as e:
         print(f"(!) chat_node 실패: {e}")
         return {
             **state,
-            "response_text": "멍! 지금은 조금 헷갈린다멍. 잠시 후에 다시 말해달라멍!",
+            "response_text": "잠시 후 다시 말씀해주세요!",
             "action_required": "NONE",
             "next_step": "IDLE",
             "show_confirmation": False,
@@ -398,6 +470,8 @@ def route_by_intent(state: AgentState) -> str:
         "COMPLETE_DOSE": "complete_dose",
         "SET_ALARM": "set_alarm",
         "IOT_EVENT": "iot_action",
+        "SEARCH_DRUG": "search_drug",
+        "WRITE_POST": "write_post",
         "CHAT": "chat"
     }
     return routes.get(intent, "chat")
@@ -415,6 +489,8 @@ workflow.add_node("navigate", navigate_node)
 workflow.add_node("complete_dose", complete_dose_node)
 workflow.add_node("set_alarm", set_alarm_node)
 workflow.add_node("iot_action", iot_action_node)
+workflow.add_node("search_drug", search_drug_node)
+workflow.add_node("write_post", write_post_node)
 workflow.add_node("chat", chat_node)
 
 workflow.set_entry_point("monitor_iot")
@@ -429,6 +505,8 @@ workflow.add_conditional_edges(
         "complete_dose": "complete_dose",
         "set_alarm": "set_alarm",
         "iot_action": "iot_action",
+        "search_drug": "search_drug",
+        "write_post": "write_post",
         "chat": "chat"
     }
 )
@@ -437,6 +515,8 @@ workflow.add_edge("navigate", END)
 workflow.add_edge("complete_dose", END)
 workflow.add_edge("set_alarm", END)
 workflow.add_edge("iot_action", END)
+workflow.add_edge("search_drug", END)
+workflow.add_edge("write_post", END)
 workflow.add_edge("chat", END)
 
 app = workflow.compile()
