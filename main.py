@@ -1,5 +1,6 @@
 import threading
 import time
+from app.api import tts
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(tts.router)
 
 def background_monitoring():
     print("🚀 [System] 실시간 IoT 확인 스레드 시작")
@@ -119,4 +122,4 @@ async def webhook_weight_log(data: MedicationData):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
