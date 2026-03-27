@@ -58,9 +58,9 @@ class AlarmParams(BaseModel):
     title: str = Field(default="")
     content: str = Field(default="")
     board_type: str = Field(default="free")
+    author: str = Field(default="")  # ← 추가
 
     model_config = {"extra": "forbid"}
-
 
 class AgentResponse(BaseModel):
     reply: str = Field(description="매디 응답 텍스트")
@@ -217,6 +217,8 @@ def monitor_iot_node(state: AgentState):
                 except json.JSONDecodeError:
                     raw_content = json.loads(content_str)
 
+
+                file_time = blob_info.last_modified.astimezone(kst).strftime('%Y-%m-%d %H:%M:%S')
                 encoded_body = raw_content.get("Body", "")
                 if not encoded_body:
                     continue
@@ -231,17 +233,29 @@ def monitor_iot_node(state: AgentState):
                     print(f"(!) 예상치 못한 Body 타입: {type(encoded_body)}")
                     continue
 
-                # ✅ 핵심 합산 로직 (하나라도 True면 오늘 먹은 것)
-                if decoded_json.get("morning"): aggregated_status["morning"] = True
-                if decoded_json.get("lunch"): aggregated_status["lunch"] = True
-                if decoded_json.get("evening"): aggregated_status["evening"] = True
-                if decoded_json.get("bedtime"): aggregated_status["bedtime"] = True
+                # ✅ 핵심 합산 로직 (boolean + action 필드 둘 다 체크)
+                action_str = str(decoded_json.get("action", "")).upper()
+
+                if decoded_json.get("morning") is True or "MORNING" in action_str:
+                    aggregated_status["morning"] = True
+                    print(f"    >>> [발견] 아침 복약 기록! ({file_time})")
+
+                if decoded_json.get("lunch") is True or "LUNCH" in action_str:
+                    aggregated_status["lunch"] = True
+                    print(f"    >>> [발견] 점심 복약 기록! ({file_time})")
+
+                if decoded_json.get("evening") is True or "EVENING" in action_str:
+                    aggregated_status["evening"] = True
+                    print(f"    >>> [발견] 저녁 복약 기록! ({file_time})")
+
+                if decoded_json.get("bedtime") is True or "BEDTIME" in action_str:
+                    aggregated_status["bedtime"] = True
+                    print(f"    >>> [발견] 취침전 복약 기록! ({file_time})")
 
                 # 최신 메타데이터 갱신
                 aggregated_status["weight_change"] = decoded_json.get("weight_change", 0.0)
                 aggregated_status["deviceId"] = decoded_json.get("deviceId", "Unknown")
 
-                file_time = blob_info.last_modified.astimezone(kst).strftime('%Y-%m-%d %H:%M:%S')
                 aggregated_status["timestamp"] = decoded_json.get("timestamp") or file_time
 
                 print(f" -> [로그 분석] {file_time} 파일 처리 완료")
@@ -460,17 +474,19 @@ def search_drug_node(state: AgentState):
 
 
 def write_post_node(state: AgentState):
-    """[Node 10] 게시글 작성"""
     print("[System] 게시글 작성 처리 중...")
 
     messages = [
         SystemMessage(content="""사용자가 게시글을 작성하고 싶어합니다.
-사용자 말에서 제목, 내용, 게시판 종류를 추출하세요.
-board_type: free(자유), question(복약질문), review(복용후기)
-자연스럽고 완성도 있는 게시글 형태로 작성해주세요.
-params에 title, content, board_type을 반드시 포함하세요."""),
+사용자 말에서 아래 정보를 추출하세요.
+- title: 게시글 제목
+- author: 작성자 이름 (말 안하면 "익명"으로 설정)
+- content: 게시글 내용 (자연스럽고 완성도 있게 작성)
+- board_type: free(자유), question(복약질문), review(복용후기)
+params에 title, author, content, board_type을 반드시 포함하세요."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
+
 
     try:
         ai_res = structured_llm.invoke(messages)
@@ -505,6 +521,7 @@ def chat_node(state: AgentState):
     try:
         ai_res = structured_llm.invoke(messages)
         print(f" -> [매디 응답]: {ai_res.reply}")
+
         return {
             **state,
             "response_text": ai_res.reply,

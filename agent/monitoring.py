@@ -1,6 +1,4 @@
-# monitoring.py
 import time
-# 만든 app(그래프)과 전송 함수를 가져옵니다.
 from agent.graph import app, monitor_iot_node, send_to_joone_fastapi
 
 def start_monitoring():
@@ -13,7 +11,12 @@ def start_monitoring():
     initial_state = {
         "user_id": "User_01",
         "device_id": "Unknown",
-        "iot_status": {},
+        # ✨ 스키마 항목을 기본값으로 
+        "iot_status": {
+            "morning": False, "lunch": False, "evening": False, "bedtime": False,
+            "action": "NONE", "pill_status": "UNKNOWN", "weight_change": 0.0,
+            "timestamp": "", "rssi": 0, "epoch": 0, "zone": 1, "free_heap": 0
+        },
         "schedule": [],
         "next_step": "IDLE",
         "action_required": "NONE",
