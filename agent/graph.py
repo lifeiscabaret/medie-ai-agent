@@ -42,7 +42,7 @@ class MedicationData(BaseModel):
 
 
 class IntentClassification(BaseModel):
-    intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST", "CHAT"] = Field(
+    intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST", "CHECK_HISTORY", "CHAT"] = Field(
         description="사용자 의도 분류"
     )
     reason: str = Field(description="분류 이유")
@@ -58,9 +58,10 @@ class AlarmParams(BaseModel):
     title: str = Field(default="")
     content: str = Field(default="")
     board_type: str = Field(default="free")
-    author: str = Field(default="")  # ← 추가
+    author: str = Field(default="")
 
     model_config = {"extra": "forbid"}
+
 
 class AgentResponse(BaseModel):
     reply: str = Field(description="매디 응답 텍스트")
@@ -101,6 +102,7 @@ class AgentState(TypedDict):
     user_confirmed: bool
     show_confirmation: bool
     params: dict
+    pill_history: List[dict]  # ✅ 추가
 
 
 # =========================================================
@@ -172,7 +174,6 @@ def monitor_iot_node(state: AgentState):
         blob_service_client = BlobServiceClient.from_connection_string(conn_str)
         container_client = blob_service_client.get_container_client(container_name)
 
-        # ✅ KST 기준 새벽 4시 복약 기준일 계산
         kst = timezone(timedelta(hours=9))
         now = datetime.now(kst)
         if now.hour < 4:
@@ -184,7 +185,6 @@ def monitor_iot_node(state: AgentState):
 
         blobs = list(container_client.list_blobs())
 
-        # ✅ 시작 시간 이후 파일만 필터링
         relevant_blobs = [
             b for b in blobs
             if b.last_modified.astimezone(kst) >= start_time
@@ -194,7 +194,6 @@ def monitor_iot_node(state: AgentState):
             print("(!) 해당 기준 시간 이후 저장된 데이터가 없습니다.")
             return {**state, "iot_status": {}}
 
-        # ✅ 합산할 기본 상태 초기화
         aggregated_status = {
             "morning": False,
             "lunch": False,
@@ -205,7 +204,6 @@ def monitor_iot_node(state: AgentState):
             "timestamp": ""
         }
 
-        # ✅ 시간순 정렬 후 순차 처리
         for blob_info in sorted(relevant_blobs, key=lambda x: x.last_modified):
             try:
                 blob_client = container_client.get_blob_client(blob_info)
@@ -217,13 +215,11 @@ def monitor_iot_node(state: AgentState):
                 except json.JSONDecodeError:
                     raw_content = json.loads(content_str)
 
-
                 file_time = blob_info.last_modified.astimezone(kst).strftime('%Y-%m-%d %H:%M:%S')
                 encoded_body = raw_content.get("Body", "")
                 if not encoded_body:
                     continue
 
-                # ✅ Body 타입 분기 처리
                 if isinstance(encoded_body, dict):
                     decoded_json = encoded_body
                 elif isinstance(encoded_body, str):
@@ -233,7 +229,7 @@ def monitor_iot_node(state: AgentState):
                     print(f"(!) 예상치 못한 Body 타입: {type(encoded_body)}")
                     continue
 
-                # ✅ 핵심 합산 로직 (boolean + action 필드 둘 다 체크)
+                # ✅ boolean + action 필드 둘 다 체크
                 action_str = str(decoded_json.get("action", "")).upper()
 
                 if decoded_json.get("morning") is True or "MORNING" in action_str:
@@ -252,10 +248,8 @@ def monitor_iot_node(state: AgentState):
                     aggregated_status["bedtime"] = True
                     print(f"    >>> [발견] 취침전 복약 기록! ({file_time})")
 
-                # 최신 메타데이터 갱신
                 aggregated_status["weight_change"] = decoded_json.get("weight_change", 0.0)
                 aggregated_status["deviceId"] = decoded_json.get("deviceId", "Unknown")
-
                 aggregated_status["timestamp"] = decoded_json.get("timestamp") or file_time
 
                 print(f" -> [로그 분석] {file_time} 파일 처리 완료")
@@ -264,7 +258,6 @@ def monitor_iot_node(state: AgentState):
                 print(f" -> [경고] 파일 해석 중 오류(무시): {err}")
                 continue
 
-        # ✅ 루프 끝난 후 aggregated_status로 Pydantic 검증
         try:
             validated_data = MedicationData(**aggregated_status)
             clean_dict = validated_data.model_dump()
@@ -331,6 +324,7 @@ def classify_intent_node(state: AgentState):
 - IOT_EVENT: IoT 기기 관련
 - SEARCH_DRUG: 약 검색 (타이레놀 찾아줘, OO약 검색해줘 등)
 - WRITE_POST: 게시글 작성 (후기 써줘, 게시판에 올려줘 등)
+- CHECK_HISTORY: 복약 내역 확인 (오늘 약 먹었어?, 이번주 언제 안 먹었어? 등)
 - CHAT: 그 외 일반 대화, 약 정보 질문 등"""),
         HumanMessage(content=f"사용자 메시지: {user_message}")
     ]
@@ -441,7 +435,6 @@ def iot_action_node(state: AgentState):
 
 
 def search_drug_node(state: AgentState):
-    """[Node 9] 약 검색 실행"""
     print("[System] 약 검색 처리 중...")
 
     messages = [
@@ -487,7 +480,6 @@ params에 title, author, content, board_type을 반드시 포함하세요."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
 
-
     try:
         ai_res = structured_llm.invoke(messages)
         return {
@@ -510,6 +502,51 @@ params에 title, author, content, board_type을 반드시 포함하세요."""),
         }
 
 
+def check_history_node(state: AgentState):
+    """[Node 11] 복약 내역 확인"""
+    print("[System] 복약 내역 확인 중...")
+
+    iot_data = state.get("iot_status", {})
+    pill_history = state.get("pill_history", [])
+
+    m = "드셨어요" if iot_data.get("morning") else "안 드셨어요"
+    l = "드셨어요" if iot_data.get("lunch") else "안 드셨어요"
+    e = "드셨어요" if iot_data.get("evening") else "안 드셨어요"
+    b = "드셨어요" if iot_data.get("bedtime") else "안 드셨어요"
+
+    history_summary = f"아침 {m}, 점심 {l}, 저녁 {e}, 취침전 {b}"
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=f"""사용자가 복약 내역을 물어봤어요.
+오늘 복약 현황: {history_summary}
+최근 복약 기록: {pill_history}
+사용자 질문: {state['messages'][-1]}
+자연스럽게 복약 내역을 알려주세요.""")
+    ]
+
+    try:
+        ai_res = structured_llm.invoke(messages)
+        return {
+            **state,
+            "response_text": ai_res.reply,
+            "action_required": "NONE",
+            "next_step": "NONE",
+            "show_confirmation": False,
+            "params": {}
+        }
+    except Exception as e:
+        print(f"(!) check_history_node 실패: {e}")
+        return {
+            **state,
+            "response_text": "복약 내역을 확인할 수 없어요. 다시 시도해주세요!",
+            "action_required": "NONE",
+            "next_step": "NONE",
+            "show_confirmation": False,
+            "params": {}
+        }
+
+
 def chat_node(state: AgentState):
     print("[System] 일반 대화 처리 중...")
 
@@ -521,7 +558,6 @@ def chat_node(state: AgentState):
     try:
         ai_res = structured_llm.invoke(messages)
         print(f" -> [매디 응답]: {ai_res.reply}")
-
         return {
             **state,
             "response_text": ai_res.reply,
@@ -556,6 +592,7 @@ def route_by_intent(state: AgentState) -> str:
         "IOT_EVENT": "iot_action",
         "SEARCH_DRUG": "search_drug",
         "WRITE_POST": "write_post",
+        "CHECK_HISTORY": "check_history",  # ✅ 추가
         "CHAT": "chat"
     }
     return routes.get(intent, "chat")
@@ -575,6 +612,7 @@ workflow.add_node("set_alarm", set_alarm_node)
 workflow.add_node("iot_action", iot_action_node)
 workflow.add_node("search_drug", search_drug_node)
 workflow.add_node("write_post", write_post_node)
+workflow.add_node("check_history", check_history_node)  # ✅ 추가
 workflow.add_node("chat", chat_node)
 
 workflow.set_entry_point("monitor_iot")
@@ -591,6 +629,7 @@ workflow.add_conditional_edges(
         "iot_action": "iot_action",
         "search_drug": "search_drug",
         "write_post": "write_post",
+        "check_history": "check_history",  # ✅ 추가
         "chat": "chat"
     }
 )
@@ -601,6 +640,7 @@ workflow.add_edge("set_alarm", END)
 workflow.add_edge("iot_action", END)
 workflow.add_edge("search_drug", END)
 workflow.add_edge("write_post", END)
+workflow.add_edge("check_history", END)  # ✅ 추가
 workflow.add_edge("chat", END)
 
 app = workflow.compile()
@@ -665,7 +705,7 @@ def send_push_notification(user_id: str, title: str, body: str):
 # =========================================================
 # 9. 메인 인터페이스 함수
 # =========================================================
-def get_medie_response(user_message: str, current_mode: str):
+def get_medie_response(user_message: str, current_mode: str, pill_history: list = []):  # ✅ 추가
     initial_state = {
         "user_id": "User_01",
         "device_id": "Unknown",
@@ -678,7 +718,8 @@ def get_medie_response(user_message: str, current_mode: str):
         "messages": [user_message],
         "user_confirmed": False,
         "show_confirmation": False,
-        "params": {}
+        "params": {},
+        "pill_history": pill_history  # ✅ 추가
     }
 
     final_result = app.invoke(initial_state)
