@@ -43,7 +43,8 @@ def background_monitoring():
         "messages": [],
         "user_confirmed": False,
         "show_confirmation": False,
-        "params": {}
+        "params": {},
+        "pill_history": []  # ← 추가
     }
 
     while True:
@@ -67,6 +68,7 @@ class ChatRequest(BaseModel):
     message: str
     current_mode: str
     user_id: str = "User_01"
+    pill_history: list = []  # ← 추가
 
 @app.get("/health")
 async def health_check():
@@ -77,7 +79,7 @@ async def health_check():
 async def chat_endpoint(req: ChatRequest):
     """매디 챗 엔드포인트"""
     try:
-        result = get_medie_response(req.message, req.current_mode)
+        result = get_medie_response(req.message, req.current_mode, req.pill_history)
         return {
             "reply": result.get("reply"),
             "command": result.get("command"),
@@ -113,7 +115,8 @@ async def webhook_weight_log(data: MedicationData):
         "messages": [],
         "user_confirmed": False,
         "show_confirmation": False,
-        "params": {}
+        "params": {},
+        "pill_history": []  # ← 추가
     }
 
     final_result = medie_graph.invoke(event_state)
