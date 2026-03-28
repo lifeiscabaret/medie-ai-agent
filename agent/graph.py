@@ -385,10 +385,12 @@ def classify_intent_node(state: AgentState):
 
 
 def navigate_node(state: AgentState):
-    print("[System] 화면 이동 처리 중...")
+    chat_history = state.get("chat_history", [])
+    last_msg = chat_history[-1]["content"] if chat_history else ""
+
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"사용자가 화면 이동을 원합니다. 메시지: {state['messages'][-1]}\n어떤 화면으로 이동할지 결정하고 친절하게 안내해주세요.")
+        HumanMessage(content=f"이전 대화: {last_msg}\n사용자 요청: {state['messages'][-1]}\n화면 이동 결정 후 친절하게 안내해주세요.")
     ]
     try:
         ai_res = fast_structured.invoke(messages)
@@ -541,12 +543,12 @@ def check_history_node(state: AgentState):
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"""사용자가 복약 내역을 물어봤어요.
-오늘 복약 현황 (IoT 기기 기준): {history_summary}
-앱 내 복약 기록 이력: {pill_history}
-사용자 질문: {state['messages'][-1]}
-두 데이터를 종합해서 자연스럽게 알려주세요.
-날짜별로 먹은 날/안 먹은 날 구분해서 답해주세요.""")
+        HumanMessage(content=f"""복약 내역 질문이에요.
+오늘 현황: {history_summary}
+기록 이력: {pill_history}
+질문: {state['messages'][-1]}
+이전 대화 맥락: {state.get('chat_history', [])[-2:]}
+자연스럽게 답해주세요.""")
     ]
 
     try:
@@ -599,10 +601,11 @@ def drug_info_node(state: AgentState):
 """
             messages = [
                 SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=f"""식약처 공식 정보를 바탕으로 답해주세요.
+                HumanMessage(content=f"""식약처 정보 기반으로 답해주세요.
 {drug_context}
-사용자 질문: {user_message}
-핵심만 자연스럽게 요약해주세요.""")
+이전 대화: {state.get('chat_history', [])[-2:]}
+질문: {user_message}
+핵심만 요약해주세요.""")
             ]
 
         ai_res = rich_structured.invoke(messages)
