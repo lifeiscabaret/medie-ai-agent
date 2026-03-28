@@ -7,6 +7,7 @@ import requests
 from typing import TypedDict, Annotated, List, Literal
 from json import JSONDecoder
 
+
 from pydantic import BaseModel, Field, ValidationError
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -403,13 +404,23 @@ def navigate_node(state: AgentState):
 
 
 def complete_dose_node(state: AgentState):
-    """✅ 복용 완료 - 이력 저장 + last_confirmed_timestamp 업데이트"""
     print("[System] 복약 완료 처리 중...")
     taken_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     iot_data = state.get("iot_status", {})
     iot_timestamp = iot_data.get("timestamp", taken_at)
 
-    # 현재 복약 이력 추가
+    # ✅ 조원 DB에 복약 기록 저장
+    try:
+        requests.post("http://20.106.40.121/api/history", json={
+            "user_id": state.get("user_id", "User_01"),
+            "pill_name": "복약",
+            "scheduled_time": taken_at[11:16],
+            "taken_at": taken_at
+        }, timeout=3)
+        print("✅ 복약 이력 DB 저장 완료")
+    except Exception as e:
+        print(f"⚠️ 복약 이력 저장 실패 (무시): {e}")
+
     new_record = {
         "date": taken_at[:10],
         "time": taken_at[11:16],
@@ -427,7 +438,7 @@ def complete_dose_node(state: AgentState):
         "show_confirmation": False,
         "params": {"taken_at": taken_at},
         "pill_history": updated_history,
-        "last_confirmed_timestamp": iot_timestamp,  # 중복 팝업 방지
+        "last_confirmed_timestamp": iot_timestamp,
         "user_confirmed": True,
     }
 
@@ -528,11 +539,25 @@ reply는 "게시글 초안 작성했어요! 확인해보세요 😊" 로 고정.
 
 
 def check_history_node(state: AgentState):
-    """✅ 복약 내역 확인 - pill_history 기반"""
     print("[System] 복약 내역 확인 중...")
 
     iot_data = state.get("iot_status", {})
     pill_history = state.get("pill_history", [])
+
+    # ✅ 조원 DB에서 실제 이력 가져오기
+    try:
+        res = requests.get(
+            f"http://20.106.40.121/api/history/{state.get('user_id', 'User_01')}",
+            timeout=3
+        )
+        db_history = res.json() if res.ok else []
+        print(f"✅ DB 이력 {len(db_history)}개 조회 완료")
+    except Exception as e:
+        print(f"⚠️ DB 이력 조회 실패 (무시): {e}")
+        db_history = []
+
+    # ✅ 앱 메모리 + DB 이력 합산
+    combined_history = pill_history + db_history
 
     m = "드셨어요" if iot_data.get("morning") else "안 드셨어요"
     l = "드셨어요" if iot_data.get("lunch") else "안 드셨어요"
@@ -545,7 +570,7 @@ def check_history_node(state: AgentState):
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=f"""복약 내역 질문이에요.
 오늘 현황: {history_summary}
-기록 이력: {pill_history}
+기록 이력: {combined_history}
 질문: {state['messages'][-1]}
 이전 대화 맥락: {state.get('chat_history', [])[-2:]}
 자연스럽게 답해주세요.""")
