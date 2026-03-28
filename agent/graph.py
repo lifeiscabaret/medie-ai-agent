@@ -45,7 +45,7 @@ class IntentClassification(BaseModel):
     intent: Literal[
         "NAVIGATE", "COMPLETE_DOSE", "SET_ALARM",
         "TOGGLE_ALL_ALARMS", "DELETE_ALL_ALARMS",
-        "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST",
+        "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST", "POST_SUBMIT",
         "CHECK_HISTORY", "DRUG_INFO", "CHAT"
     ] = Field(description="사용자 의도 분류")
     reason: str = Field(description="분류 이유")
@@ -329,9 +329,10 @@ def classify_intent_node(state: AgentState):
         (["알람 다 지워", "알람 삭제", "모든 알람 삭제"], "DELETE_ALL_ALARMS"),
         (["약 먹었", "방금 먹었"], "COMPLETE_DOSE"),
         (["약 검색", "약 찾아줘", "검색해줘"], "SEARCH_DRUG"),
-        (["게시글 써", "후기 써줘", "올려줘", "게시판에"], "WRITE_POST"),
-        (["오늘 약", "복용 내역", "언제 안 먹"], "CHECK_HISTORY"),
+        (["게시글 써줘", "후기 써줘", "글 써줘", "작성해줘"], "WRITE_POST"),
+        (["올려줘", "등록해줘", "게시판에 올려", "업로드해줘"], "POST_SUBMIT"),
     ]
+
 
     for keywords, intent in quick_rules:
         if any(k in user_message for k in keywords):
@@ -370,6 +371,7 @@ def classify_intent_node(state: AgentState):
 - IOT_EVENT: IoT 기기 관련
 - SEARCH_DRUG: 약 검색 (타이레놀 찾아줘, OO약 검색해줘)
 - WRITE_POST: 게시글 작성 (후기 써줘, 게시판에 올려줘)
+- POST_SUBMIT: 게시글 바로 등록 (올려줘, 등록해줘, 업로드해줘)  ← 이거 추가
 - CHECK_HISTORY: 복약 내역 확인 (오늘 약 먹었어?, 이번주 언제 안먹었어?, 4월 복용내역)
 - DRUG_INFO: 약 부작용/효능/주의사항 질문 (타이레놀 부작용 뭐야?)
 - CHAT: 그 외 일반 대화"""),
@@ -537,7 +539,24 @@ reply는 "게시글 초안 작성했어요! 확인해보세요 😊" 로 고정.
         return {**state, "response_text": "게시글 내용을 말씀해주세요!", "action_required": "NONE",
                 "next_step": "NONE", "show_confirmation": False, "params": {}}
 
-
+def post_submit_node(state: AgentState):
+    print("[System] 게시글 등록 처리 중...")
+    messages = [
+        SystemMessage(content="""사용자가 게시글을 바로 등록하고 싶어합니다.
+제목, 내용, 게시판 종류를 추출해서 등록 준비해주세요.
+board_type: free/med_question/review/notice
+reply는 "게시글을 등록할게요! 내용을 확인해주세요 😊" 로 고정."""),
+        HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
+    ]
+    try:
+        ai_res = fast_structured.invoke(messages)
+        return {**state, "response_text": ai_res.reply, "action_required": "WRITE_POST",
+                "next_step": "WRITE_BOARD", "show_confirmation": False,
+                "params": ai_res.params.model_dump()}
+    except Exception as e:
+        return {**state, "response_text": "게시글 내용을 말씀해주세요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
+    
 def check_history_node(state: AgentState):
     print("[System] 복약 내역 확인 중...")
 
@@ -690,7 +709,8 @@ def route_by_intent(state: AgentState) -> str:
         "WRITE_POST": "write_post",
         "CHECK_HISTORY": "check_history",
         "DRUG_INFO": "drug_info",
-        "CHAT": "chat"
+        "CHAT": "chat",
+        "POST_SUBMIT": "post_submit"
     }
     return routes.get(intent, "chat")
 
@@ -711,10 +731,12 @@ workflow.add_node("write_post", write_post_node)
 workflow.add_node("check_history", check_history_node)
 workflow.add_node("drug_info", drug_info_node)
 workflow.add_node("chat", chat_node)
+workflow.add_node("post_submit", post_submit_node)
 
 workflow.set_entry_point("monitor_iot")
 workflow.add_edge("monitor_iot", "analyze_schedule")
 workflow.add_edge("analyze_schedule", "classify_intent")
+workflow.add_edge("post_submit", END)
 
 workflow.add_conditional_edges(
     "classify_intent",
@@ -730,7 +752,8 @@ workflow.add_conditional_edges(
         "write_post": "write_post",
         "check_history": "check_history",
         "drug_info": "drug_info",
-        "chat": "chat"
+        "chat": "chat",
+        "post_submit": "post_submit"
     }
 )
 
