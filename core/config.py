@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     elevenlabs_voice_id: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
 
+    drug_api_key: str | None = None        # ← 추가
+    drug_api_endpoint: str | None = None   # ← 추가
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

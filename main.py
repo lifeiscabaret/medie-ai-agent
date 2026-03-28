@@ -44,7 +44,9 @@ def background_monitoring():
         "user_confirmed": False,
         "show_confirmation": False,
         "params": {},
-        "pill_history": []  # ← 추가
+        "pill_history": [],  # ← 추가
+        "chat_history": [],           # ← 추가
+        "last_confirmed_timestamp": ""  # ← 추가
     }
 
     while True:
@@ -68,7 +70,9 @@ class ChatRequest(BaseModel):
     message: str
     current_mode: str
     user_id: str = "User_01"
-    pill_history: list = []  # ← 추가
+    pill_history: list = []
+    chat_history: list = []
+    last_confirmed_timestamp: str = ""  # ← 추가
 
 @app.get("/health")
 async def health_check():
@@ -77,20 +81,27 @@ async def health_check():
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
-    """매디 챗 엔드포인트"""
     try:
-        result = get_medie_response(req.message, req.current_mode, req.pill_history)
+        result = get_medie_response(
+            req.message,
+            req.current_mode,
+            req.pill_history,
+            req.chat_history,
+            req.last_confirmed_timestamp
+        )
         return {
             "reply": result.get("reply"),
             "command": result.get("command"),
             "target": result.get("target"),
             "show_confirmation": result.get("show_confirmation", False),
-            "params": result.get("params", {})
+            "params": result.get("params", {}),
+            "pill_history": result.get("pill_history", []),
+            "last_confirmed_timestamp": result.get("last_confirmed_timestamp", ""),
         }
     except Exception as e:
         print(f"❌ [Chat Error] {e}")
         return {
-            "reply": "멍! 대답하기가 조금 힘들다멍...",
+            "reply": "잠시 후 다시 말씀해주세요!",
             "command": "NONE",
             "target": "IDLE",
             "show_confirmation": False,
@@ -116,7 +127,9 @@ async def webhook_weight_log(data: MedicationData):
         "user_confirmed": False,
         "show_confirmation": False,
         "params": {},
-        "pill_history": []  # ← 추가
+        "pill_history": [],  # ← 추가
+        "chat_history": [],              # ← 추가
+        "last_confirmed_timestamp": ""   # ← 추가
     }
 
     final_result = medie_graph.invoke(event_state)
