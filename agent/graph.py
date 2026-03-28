@@ -511,11 +511,9 @@ def search_drug_node(state: AgentState):
 def write_post_node(state: AgentState):
     print("[System] 게시글 작성 처리 중...")
     messages = [
-        SystemMessage(content="""사용자가 게시글을 작성하고 싶어합니다.
-- title: 게시글 제목
-- author: 작성자 이름 (말 안하면 "익명")
-- content: 자연스럽고 완성도 있게 작성
-- board_type: free(자유), med_question(복약질문), review(복용후기), notice(공지사항)"""),
+        SystemMessage(content="""게시글 초안을 작성해줘.
+title: 짧고 명확하게, content: 2~3문장으로 간결하게, author: 없으면 "익명", board_type: free/med_question/review/notice
+reply는 "게시글 초안 작성했어요! 확인해보세요 😊" 로 고정."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
     try:
