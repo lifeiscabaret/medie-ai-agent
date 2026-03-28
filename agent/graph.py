@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import time
+import urllib.parse
 import requests
 from typing import TypedDict, Annotated, List, Literal
 from json import JSONDecoder
@@ -42,9 +43,12 @@ class MedicationData(BaseModel):
 
 
 class IntentClassification(BaseModel):
-    intent: Literal["NAVIGATE", "COMPLETE_DOSE", "SET_ALARM", "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST", "CHECK_HISTORY", "CHAT"] = Field(
-        description="사용자 의도 분류"
-    )
+    intent: Literal[
+        "NAVIGATE", "COMPLETE_DOSE", "SET_ALARM",
+        "TOGGLE_ALL_ALARMS", "DELETE_ALL_ALARMS",
+        "IOT_EVENT", "SEARCH_DRUG", "WRITE_POST",
+        "CHECK_HISTORY", "DRUG_INFO", "CHAT"
+    ] = Field(description="사용자 의도 분류")
     reason: str = Field(description="분류 이유")
 
 
@@ -59,6 +63,7 @@ class AlarmParams(BaseModel):
     content: str = Field(default="")
     board_type: str = Field(default="free")
     author: str = Field(default="")
+    enabled: bool = Field(default=True)
 
     model_config = {"extra": "forbid"}
 
@@ -102,7 +107,9 @@ class AgentState(TypedDict):
     user_confirmed: bool
     show_confirmation: bool
     params: dict
-    pill_history: List[dict]  # ✅ 추가
+    pill_history: List[dict]
+    chat_history: List[dict]
+    last_confirmed_timestamp: str  # ✅ 중복 팝업 방지
 
 
 # =========================================================
@@ -130,10 +137,9 @@ intent_llm = AzureChatOpenAI(
 
 
 # =========================================================
-# 4. DB 연결 함수 (조원 API 나오면 여기만 채우면 됨)
+# 4. DB 연결 함수
 # =========================================================
 async def get_user_profile(user_id: str):
-    """TODO: 조원 API 연결"""
     return {
         "habit_strength": "medium",
         "miss_risk_score": 0.5,
@@ -146,21 +152,54 @@ async def get_user_profile(user_id: str):
     }
 
 async def save_medication_log(user_id: str, taken_at: str, pill_name: str, source: str = "MANUAL"):
-    """TODO: 조원 API 연결 - POST /medication-logs"""
     print(f"[DB] 복용 기록 저장: {user_id} / {pill_name} / {taken_at}")
-    pass
 
 async def update_user_profile(user_id: str, data: dict):
-    """TODO: 조원 API 연결 - PATCH /users/{user_id}/profile"""
     print(f"[DB] 프로필 업데이트: {user_id} / {data}")
-    pass
 
 
 # =========================================================
-# 5. 노드 함수 정의
+# 5. 식약처 API
+# =========================================================
+def fetch_drug_info(drug_name: str) -> dict:
+    try:
+        api_key = settings.drug_api_key
+        endpoint = settings.drug_api_endpoint
+
+        params = {
+            "serviceKey": api_key,
+            "itemName": drug_name,
+            "pageNo": "1",
+            "numOfRows": "3",
+            "type": "json"
+        }
+
+        url = f"{endpoint}?{urllib.parse.urlencode(params)}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+
+        items = data.get("body", {}).get("items", [])
+        if not items:
+            return {}
+
+        item = items[0]
+        return {
+            "name": item.get("itemName", ""),
+            "effect": item.get("efcyQesitm", ""),
+            "usage": item.get("useMethodQesitm", ""),
+            "warning": item.get("atpnWarnQesitm", ""),
+            "interaction": item.get("intrcQesitm", ""),
+            "side_effect": item.get("seQesitm", ""),
+        }
+    except Exception as e:
+        print(f"(!) 식약처 API 오류: {e}")
+        return {}
+
+
+# =========================================================
+# 6. 노드 함수 정의
 # =========================================================
 def monitor_iot_node(state: AgentState):
-    """[Node 1] Azure Storage에서 오늘치 IoT 데이터를 모두 가져와 복약 상태를 합산"""
     user_message = state["messages"][0] if state["messages"] else ""
     if user_message and user_message.strip():
         print("[System] 사용자 메시지 감지 → IoT 로드 스킵")
@@ -181,27 +220,19 @@ def monitor_iot_node(state: AgentState):
         else:
             start_time = now.replace(hour=4, minute=0, second=0, microsecond=0)
 
-        print(f" -> 집계 시작 시점: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-
         blobs = list(container_client.list_blobs())
-
         relevant_blobs = [
             b for b in blobs
             if b.last_modified.astimezone(kst) >= start_time
         ]
 
         if not relevant_blobs:
-            print("(!) 해당 기준 시간 이후 저장된 데이터가 없습니다.")
             return {**state, "iot_status": {}}
 
         aggregated_status = {
-            "morning": False,
-            "lunch": False,
-            "evening": False,
-            "bedtime": False,
-            "weight_change": 0.0,
-            "deviceId": "Unknown",
-            "timestamp": ""
+            "morning": False, "lunch": False,
+            "evening": False, "bedtime": False,
+            "weight_change": 0.0, "deviceId": "Unknown", "timestamp": ""
         }
 
         for blob_info in sorted(relevant_blobs, key=lambda x: x.last_modified):
@@ -226,33 +257,22 @@ def monitor_iot_node(state: AgentState):
                     decoded_bytes = base64.b64decode(encoded_body)
                     decoded_json = json.loads(decoded_bytes)
                 else:
-                    print(f"(!) 예상치 못한 Body 타입: {type(encoded_body)}")
                     continue
 
-                # ✅ boolean + action 필드 둘 다 체크
                 action_str = str(decoded_json.get("action", "")).upper()
 
                 if decoded_json.get("morning") is True or "MORNING" in action_str:
                     aggregated_status["morning"] = True
-                    print(f"    >>> [발견] 아침 복약 기록! ({file_time})")
-
                 if decoded_json.get("lunch") is True or "LUNCH" in action_str:
                     aggregated_status["lunch"] = True
-                    print(f"    >>> [발견] 점심 복약 기록! ({file_time})")
-
                 if decoded_json.get("evening") is True or "EVENING" in action_str:
                     aggregated_status["evening"] = True
-                    print(f"    >>> [발견] 저녁 복약 기록! ({file_time})")
-
                 if decoded_json.get("bedtime") is True or "BEDTIME" in action_str:
                     aggregated_status["bedtime"] = True
-                    print(f"    >>> [발견] 취침전 복약 기록! ({file_time})")
 
                 aggregated_status["weight_change"] = decoded_json.get("weight_change", 0.0)
                 aggregated_status["deviceId"] = decoded_json.get("deviceId", "Unknown")
                 aggregated_status["timestamp"] = decoded_json.get("timestamp") or file_time
-
-                print(f" -> [로그 분석] {file_time} 파일 처리 완료")
 
             except Exception as err:
                 print(f" -> [경고] 파일 해석 중 오류(무시): {err}")
@@ -267,12 +287,7 @@ def monitor_iot_node(state: AgentState):
             e = "O" if clean_dict['evening'] else "X"
             b = "O" if clean_dict['bedtime'] else "X"
 
-            print(f"\n[Maddy Summary] --- 4시 기준 오늘치 합산 결과 ---")
-            print(f" 📅 기준 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 이후")
-            print(f" 💊 복약 현황: 아침({m}) 점심({l}) 저녁({e}) 취침전({b})")
-            print(f" ⚖️ 최신 감지된 무게 변화: {clean_dict['weight_change']}g")
-            print(f" 🕒 최종 업데이트: {clean_dict['timestamp']}")
-            print(f"----------------------------------------------\n")
+            print(f"\n[Maddy Summary] 아침({m}) 점심({l}) 저녁({e}) 취침전({b})")
 
             return {
                 **state,
@@ -300,8 +315,10 @@ def classify_intent_node(state: AgentState):
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
 
+    # ✅ IoT 이벤트 - 이미 확인한 타임스탬프는 무시
     if abs(weight_change) > 1.0:
         timestamp_str = iot_data.get("timestamp", "")
+        last_confirmed = state.get("last_confirmed_timestamp", "")
         is_recent = False
         try:
             iot_time = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
@@ -310,22 +327,25 @@ def classify_intent_node(state: AgentState):
         except:
             is_recent = False
 
-        if is_recent:
-            print(f" -> [IoT 감지] 최근 데이터! 무게 변화: {weight_change}g → IOT_EVENT")
+        if is_recent and timestamp_str != last_confirmed:
+            print(f" -> [IoT 감지] 무게 변화: {weight_change}g → IOT_EVENT")
             return {**state, "intent": "IOT_EVENT"}
         else:
-            print(f" -> [IoT 무시] 오래된 데이터 ({timestamp_str})")
+            print(f" -> [IoT 무시] 오래된 데이터이거나 이미 확인한 데이터")
 
     classify_messages = [
         SystemMessage(content="""사용자 메시지를 보고 의도를 분류하세요.
-- NAVIGATE: 화면 이동 요청 (약국 찾아줘, 스캔해줘, 내 약 보여줘 등)
-- COMPLETE_DOSE: 복약 완료 (약 먹었어, 복용했어, 먹었다, 응 먹었어 등)
-- SET_ALARM: 알람 시간 변경 (8시로 바꿔줘, 알람 설정해줘 등)
+- NAVIGATE: 화면 이동 요청 (약국, 스캔, 내 약, 알람, 마이페이지, 커뮤니티, 히스토리 등)
+- COMPLETE_DOSE: 복약 완료 (약 먹었어, 먹었다, 응 먹었어 등)
+- SET_ALARM: 특정 알람 시간 변경 (8시로 바꿔줘 등)
+- TOGGLE_ALL_ALARMS: 모든 알람 켜기/끄기 (알람 다 켜줘, 알람 다 꺼줘)
+- DELETE_ALL_ALARMS: 모든 알람 삭제 (알람 다 지워줘)
 - IOT_EVENT: IoT 기기 관련
-- SEARCH_DRUG: 약 검색 (타이레놀 찾아줘, OO약 검색해줘 등)
-- WRITE_POST: 게시글 작성 (후기 써줘, 게시판에 올려줘 등)
-- CHECK_HISTORY: 복약 내역 확인 (오늘 약 먹었어?, 이번주 언제 안 먹었어? 등)
-- CHAT: 그 외 일반 대화, 약 정보 질문 등"""),
+- SEARCH_DRUG: 약 검색 (타이레놀 찾아줘, OO약 검색해줘)
+- WRITE_POST: 게시글 작성 (후기 써줘, 게시판에 올려줘)
+- CHECK_HISTORY: 복약 내역 확인 (오늘 약 먹었어?, 이번주 언제 안먹었어?, 4월 복용내역)
+- DRUG_INFO: 약 부작용/효능/주의사항 질문 (타이레놀 부작용 뭐야?)
+- CHAT: 그 외 일반 대화"""),
         HumanMessage(content=f"사용자 메시지: {user_message}")
     ]
 
@@ -340,37 +360,36 @@ def classify_intent_node(state: AgentState):
 
 def navigate_node(state: AgentState):
     print("[System] 화면 이동 처리 중...")
-
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=f"사용자가 화면 이동을 원합니다. 메시지: {state['messages'][-1]}\n어떤 화면으로 이동할지 결정하고 친절하게 안내해주세요.")
     ]
-
     try:
         ai_res = structured_llm.invoke(messages)
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": "NAVIGATE",
-            "next_step": ai_res.target,
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": "NAVIGATE",
+                "next_step": ai_res.target, "show_confirmation": False, "params": {}}
     except Exception as e:
         print(f"(!) navigate_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "죄송해요, 다시 말씀해주세요!",
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "죄송해요, 다시 말씀해주세요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
 
 
 def complete_dose_node(state: AgentState):
+    """✅ 복용 완료 - 이력 저장 + last_confirmed_timestamp 업데이트"""
     print("[System] 복약 완료 처리 중...")
     taken_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    iot_data = state.get("iot_status", {})
+    iot_timestamp = iot_data.get("timestamp", taken_at)
+
+    # 현재 복약 이력 추가
+    new_record = {
+        "date": taken_at[:10],
+        "time": taken_at[11:16],
+        "taken": True,
+        "source": "confirmed"
+    }
+    current_history = state.get("pill_history", [])
+    updated_history = current_history + [new_record]
 
     return {
         **state,
@@ -378,13 +397,15 @@ def complete_dose_node(state: AgentState):
         "action_required": "COMPLETE_DOSE",
         "next_step": "NONE",
         "show_confirmation": False,
-        "params": {"taken_at": taken_at}
+        "params": {"taken_at": taken_at},
+        "pill_history": updated_history,
+        "last_confirmed_timestamp": iot_timestamp,  # ✅ 중복 팝업 방지
+        "user_confirmed": True,
     }
 
 
 def set_alarm_node(state: AgentState):
     print("[System] 알람 시간 변경 처리 중...")
-
     messages = [
         SystemMessage(content="""사용자가 알람 시간을 변경하고 싶어합니다.
 메시지에서 시간을 추출해서 HH:MM 형식으로 변환하세요.
@@ -392,35 +413,46 @@ def set_alarm_node(state: AgentState):
 반드시 params에 time과 pillId를 포함하세요. pillId는 "all"로 설정하세요."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
-
     try:
         ai_res = structured_llm.invoke(messages)
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": "SET_ALARM",
-            "next_step": "ALARM",
-            "show_confirmation": False,
-            "params": ai_res.params.model_dump()
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": "SET_ALARM",
+                "next_step": "ALARM", "show_confirmation": False, "params": ai_res.params.model_dump()}
     except Exception as e:
-        print(f"(!) set_alarm_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "알람 시간을 말씀해주세요!",
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "알람 시간을 말씀해주세요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
+
+
+def toggle_all_alarms_node(state: AgentState):
+    print("[System] 모든 알람 켜기/끄기 처리 중...")
+    user_message = state["messages"][-1]
+    enabled = "켜" in user_message or "on" in user_message.lower()
+    status = "켰어요" if enabled else "껐어요"
+    return {
+        **state,
+        "response_text": f"모든 알람을 {status}! 💊",
+        "action_required": "TOGGLE_ALL_ALARMS",
+        "next_step": "ALARM",
+        "show_confirmation": False,
+        "params": {"enabled": enabled}
+    }
+
+
+def delete_all_alarms_node(state: AgentState):
+    print("[System] 모든 알람 삭제 처리 중...")
+    return {
+        **state,
+        "response_text": "모든 알람을 삭제했어요!",
+        "action_required": "DELETE_ALL_ALARMS",
+        "next_step": "ALARM",
+        "show_confirmation": False,
+        "params": {}
+    }
 
 
 def iot_action_node(state: AgentState):
     print("[System] IoT 이벤트 처리 중...")
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
-    print(f" -> 무게 변화 감지: {weight_change}g → 복약 확인 팝업 표시")
-
     return {
         **state,
         "response_text": "약통에서 움직임이 감지됐어요! 방금 약 드셨나요?",
@@ -436,74 +468,41 @@ def iot_action_node(state: AgentState):
 
 def search_drug_node(state: AgentState):
     print("[System] 약 검색 처리 중...")
-
     messages = [
         SystemMessage(content="""사용자가 약을 검색하고 싶어합니다.
-메시지에서 약 이름을 추출해서 keyword로 설정하세요.
-예: "타이레놀 검색해줘" → params.keyword = "타이레놀" """),
+메시지에서 약 이름을 추출해서 keyword로 설정하세요."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
-
     try:
         ai_res = structured_llm.invoke(messages)
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": "SEARCH_DRUG",
-            "next_step": "SEARCH_PILL",
-            "show_confirmation": False,
-            "params": ai_res.params.model_dump()
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": "SEARCH_DRUG",
+                "next_step": "SEARCH_PILL", "show_confirmation": False, "params": ai_res.params.model_dump()}
     except Exception as e:
-        print(f"(!) search_drug_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "검색할 약 이름을 말씀해주세요!",
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "검색할 약 이름을 말씀해주세요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
 
 
 def write_post_node(state: AgentState):
     print("[System] 게시글 작성 처리 중...")
-
     messages = [
         SystemMessage(content="""사용자가 게시글을 작성하고 싶어합니다.
-사용자 말에서 아래 정보를 추출하세요.
 - title: 게시글 제목
-- author: 작성자 이름 (말 안하면 "익명"으로 설정)
-- content: 게시글 내용 (자연스럽고 완성도 있게 작성)
-- board_type: free(자유), question(복약질문), review(복용후기)
-params에 title, author, content, board_type을 반드시 포함하세요."""),
+- author: 작성자 이름 (말 안하면 "익명")
+- content: 자연스럽고 완성도 있게 작성
+- board_type: free(자유), med_question(복약질문), review(복용후기), notice(공지사항)"""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
-
     try:
         ai_res = structured_llm.invoke(messages)
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": "WRITE_POST",
-            "next_step": "WRITE_BOARD",
-            "show_confirmation": True,
-            "params": ai_res.params.model_dump()
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": "WRITE_POST",
+                "next_step": "WRITE_BOARD", "show_confirmation": True, "params": ai_res.params.model_dump()}
     except Exception as e:
-        print(f"(!) write_post_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "게시글 내용을 말씀해주세요!",
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "게시글 내용을 말씀해주세요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
 
 
 def check_history_node(state: AgentState):
-    """[Node 11] 복약 내역 확인"""
+    """✅ 복약 내역 확인 - pill_history 기반"""
     print("[System] 복약 내역 확인 중...")
 
     iot_data = state.get("iot_status", {})
@@ -519,63 +518,107 @@ def check_history_node(state: AgentState):
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=f"""사용자가 복약 내역을 물어봤어요.
-오늘 복약 현황: {history_summary}
-최근 복약 기록: {pill_history}
+오늘 복약 현황 (IoT 기기 기준): {history_summary}
+앱 내 복약 기록 이력: {pill_history}
 사용자 질문: {state['messages'][-1]}
-자연스럽게 복약 내역을 알려주세요.""")
+두 데이터를 종합해서 자연스럽게 알려주세요.
+날짜별로 먹은 날/안 먹은 날 구분해서 답해주세요.""")
     ]
 
     try:
         ai_res = structured_llm.invoke(messages)
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
     except Exception as e:
-        print(f"(!) check_history_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "복약 내역을 확인할 수 없어요. 다시 시도해주세요!",
-            "action_required": "NONE",
-            "next_step": "NONE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "복약 내역을 확인할 수 없어요!", "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
+
+
+def drug_info_node(state: AgentState):
+    """✅ 식약처 API + RAG 약 정보 제공"""
+    print("[System] 약 정보 조회 중...")
+
+    user_message = state["messages"][-1]
+
+    # 약 이름 추출
+    extract_messages = [
+        SystemMessage(content="사용자 메시지에서 약 이름만 추출하세요. 약 이름만 답하세요. 없으면 '없음'이라고 답하세요."),
+        HumanMessage(content=user_message)
+    ]
+
+    try:
+        drug_name_response = llm.invoke(extract_messages)
+        drug_name = drug_name_response.content.strip()
+        print(f" -> 추출된 약 이름: {drug_name}")
+
+        if drug_name == "없음" or not drug_name:
+            return {**state, "response_text": "어떤 약에 대해 알고 싶으신가요?",
+                    "action_required": "NONE", "next_step": "NONE",
+                    "show_confirmation": False, "params": {}}
+
+        drug_info = fetch_drug_info(drug_name)
+
+        if not drug_info:
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"약 정보 질문: {user_message}\n식약처에서 해당 약을 찾지 못했어요. 알고 있는 정보로 답해주세요.")
+            ]
+        else:
+            drug_context = f"""
+[식약처 공식 약품 정보]
+약품명: {drug_info.get('name', '')}
+효능: {drug_info.get('effect', '정보 없음')}
+사용법: {drug_info.get('usage', '정보 없음')}
+주의사항: {drug_info.get('warning', '정보 없음')}
+상호작용: {drug_info.get('interaction', '정보 없음')}
+부작용: {drug_info.get('side_effect', '정보 없음')}
+"""
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"""식약처 공식 정보를 바탕으로 답해주세요.
+{drug_context}
+사용자 질문: {user_message}
+핵심만 자연스럽게 요약해주세요.""")
+            ]
+
+        ai_res = structured_llm.invoke(messages)
+        return {**state, "response_text": ai_res.reply, "action_required": "NONE",
+                "next_step": "NONE", "show_confirmation": False, "params": {}}
+
+    except Exception as e:
+        print(f"(!) drug_info_node 실패: {e}")
+        return {**state, "response_text": "약 정보를 가져오는 중 오류가 발생했어요!",
+                "action_required": "NONE", "next_step": "NONE",
+                "show_confirmation": False, "params": {}}
 
 
 def chat_node(state: AgentState):
     print("[System] 일반 대화 처리 중...")
 
+    chat_history = state.get("chat_history", [])
+    history_messages = []
+    for msg in chat_history[-6:]:
+        if msg["role"] == "user":
+            history_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            history_messages.append(SystemMessage(content=f"[이전 매디 응답]: {msg['content']}"))
+
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"현재 모드: {state.get('next_step')}\n데이터: {state['iot_status']}\n대화기록: {state['messages']}")
+        *history_messages,
+        HumanMessage(content=f"현재 모드: {state.get('next_step')}\n데이터: {state['iot_status']}\n사용자: {state['messages'][-1]}")
     ]
 
     try:
         ai_res = structured_llm.invoke(messages)
         print(f" -> [매디 응답]: {ai_res.reply}")
-        return {
-            **state,
-            "response_text": ai_res.reply,
-            "action_required": ai_res.command,
-            "next_step": ai_res.target,
-            "show_confirmation": ai_res.show_confirmation,
-            "params": ai_res.params.model_dump()
-        }
+        return {**state, "response_text": ai_res.reply, "action_required": ai_res.command,
+                "next_step": ai_res.target, "show_confirmation": ai_res.show_confirmation,
+                "params": ai_res.params.model_dump()}
     except Exception as e:
         print(f"(!) chat_node 실패: {e}")
-        return {
-            **state,
-            "response_text": "잠시 후 다시 말씀해주세요!",
-            "action_required": "NONE",
-            "next_step": "IDLE",
-            "show_confirmation": False,
-            "params": {}
-        }
+        return {**state, "response_text": "잠시 후 다시 말씀해주세요!", "action_required": "NONE",
+                "next_step": "IDLE", "show_confirmation": False, "params": {}}
 
 
 # =========================================================
@@ -584,15 +627,17 @@ def chat_node(state: AgentState):
 def route_by_intent(state: AgentState) -> str:
     intent = state.get("intent", "CHAT")
     print(f"[Router] 의도: {intent} → 해당 노드로 이동")
-
     routes = {
         "NAVIGATE": "navigate",
         "COMPLETE_DOSE": "complete_dose",
         "SET_ALARM": "set_alarm",
+        "TOGGLE_ALL_ALARMS": "toggle_all_alarms",
+        "DELETE_ALL_ALARMS": "delete_all_alarms",
         "IOT_EVENT": "iot_action",
         "SEARCH_DRUG": "search_drug",
         "WRITE_POST": "write_post",
-        "CHECK_HISTORY": "check_history",  # ✅ 추가
+        "CHECK_HISTORY": "check_history",
+        "DRUG_INFO": "drug_info",
         "CHAT": "chat"
     }
     return routes.get(intent, "chat")
@@ -609,10 +654,13 @@ workflow.add_node("classify_intent", classify_intent_node)
 workflow.add_node("navigate", navigate_node)
 workflow.add_node("complete_dose", complete_dose_node)
 workflow.add_node("set_alarm", set_alarm_node)
+workflow.add_node("toggle_all_alarms", toggle_all_alarms_node)
+workflow.add_node("delete_all_alarms", delete_all_alarms_node)
 workflow.add_node("iot_action", iot_action_node)
 workflow.add_node("search_drug", search_drug_node)
 workflow.add_node("write_post", write_post_node)
-workflow.add_node("check_history", check_history_node)  # ✅ 추가
+workflow.add_node("check_history", check_history_node)
+workflow.add_node("drug_info", drug_info_node)
 workflow.add_node("chat", chat_node)
 
 workflow.set_entry_point("monitor_iot")
@@ -626,25 +674,24 @@ workflow.add_conditional_edges(
         "navigate": "navigate",
         "complete_dose": "complete_dose",
         "set_alarm": "set_alarm",
+        "toggle_all_alarms": "toggle_all_alarms",
+        "delete_all_alarms": "delete_all_alarms",
         "iot_action": "iot_action",
         "search_drug": "search_drug",
         "write_post": "write_post",
-        "check_history": "check_history",  # ✅ 추가
+        "check_history": "check_history",
+        "drug_info": "drug_info",
         "chat": "chat"
     }
 )
 
-workflow.add_edge("navigate", END)
-workflow.add_edge("complete_dose", END)
-workflow.add_edge("set_alarm", END)
-workflow.add_edge("iot_action", END)
-workflow.add_edge("search_drug", END)
-workflow.add_edge("write_post", END)
-workflow.add_edge("check_history", END)  # ✅ 추가
-workflow.add_edge("chat", END)
+for node in ["navigate", "complete_dose", "set_alarm", "toggle_all_alarms",
+             "delete_all_alarms", "iot_action", "search_drug", "write_post",
+             "check_history", "drug_info", "chat"]:
+    workflow.add_edge(node, END)
 
 app = workflow.compile()
-print("✅ Maddy Agent 빌드 완료! (LangGraph 분기 탑재)")
+print("✅ Maddy Agent 빌드 완료!")
 
 
 # =========================================================
@@ -653,7 +700,6 @@ print("✅ Maddy Agent 빌드 완료! (LangGraph 분기 탑재)")
 def send_to_joone_fastapi(state: AgentState):
     JOONE_API_URL = "http://20.106.40.121/arduino"
     iot = state.get("iot_status", {})
-
     try:
         payload_data = BackendPayload(
             user_id=state.get("user_id", "Unknown"),
@@ -667,45 +713,33 @@ def send_to_joone_fastapi(state: AgentState):
             maddy_message=state.get("response_text", ""),
             action_required=state.get("action_required", "NONE")
         )
-
-        print(f"[Maddy] DB 서버로 전송 중... ({JOONE_API_URL})")
         response = requests.post(JOONE_API_URL, json=payload_data.model_dump(), timeout=5)
-
         if response.status_code == 200:
-            print(f"✅ 전송 성공: {response.json()}")
+            print(f"✅ 전송 성공")
         else:
-            print(f"❌ 전송 실패: {response.status_code} | {response.text}")
-
-    except ValidationError as val_err:
-        print(f"⚠️ [데이터 규격 위반]: {val_err}")
-    except requests.exceptions.RequestException as req_err:
-        print(f"(!) [네트워크 오류]: {req_err}")
+            print(f"❌ 전송 실패: {response.status_code}")
     except Exception as err:
-        print(f"(!) [시스템 오류]: {err}")
+        print(f"(!) 전송 오류: {err}")
 
 
 def send_push_notification(user_id: str, title: str, body: str):
     PUSH_API_URL = "http://20.106.40.121/push/send"
-    push_payload = {
-        "user_id": user_id,
-        "title": title,
-        "body": body,
-        "priority": "high"
-    }
     try:
-        response = requests.post(PUSH_API_URL, json=push_payload, timeout=3)
-        if response.status_code == 200:
-            print("✅ [Push 성공]")
-        else:
-            print(f"⚠️ [Push 실패] 상태 코드: {response.status_code}")
+        requests.post(PUSH_API_URL, json={"user_id": user_id, "title": title, "body": body, "priority": "high"}, timeout=3)
     except Exception as err:
-        print(f"(!) [Push 오류]: {err}")
+        print(f"(!) Push 오류: {err}")
 
 
 # =========================================================
 # 9. 메인 인터페이스 함수
 # =========================================================
-def get_medie_response(user_message: str, current_mode: str, pill_history: list = []):  # ✅ 추가
+def get_medie_response(
+    user_message: str,
+    current_mode: str,
+    pill_history: list = [],
+    chat_history: list = [],
+    last_confirmed_timestamp: str = ""
+):
     initial_state = {
         "user_id": "User_01",
         "device_id": "Unknown",
@@ -719,7 +753,9 @@ def get_medie_response(user_message: str, current_mode: str, pill_history: list 
         "user_confirmed": False,
         "show_confirmation": False,
         "params": {},
-        "pill_history": pill_history  # ✅ 추가
+        "pill_history": pill_history,
+        "chat_history": chat_history,
+        "last_confirmed_timestamp": last_confirmed_timestamp,
     }
 
     final_result = app.invoke(initial_state)
@@ -734,5 +770,7 @@ def get_medie_response(user_message: str, current_mode: str, pill_history: list 
         "command": final_result["action_required"],
         "target": final_result["next_step"],
         "show_confirmation": final_result.get("show_confirmation", False),
-        "params": final_result.get("params", {})
+        "params": final_result.get("params", {}),
+        "pill_history": final_result.get("pill_history", pill_history),
+        "last_confirmed_timestamp": final_result.get("last_confirmed_timestamp", last_confirmed_timestamp),
     }
