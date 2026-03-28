@@ -18,9 +18,7 @@ from core.config import settings
 from agent.prompts import SYSTEM_PROMPT
 
 
-# =========================================================
 # 1. Pydantic 스키마 정의
-# =========================================================
 class MedicationData(BaseModel):
     device_id: str = Field(default="Unknown", alias="deviceId")
     timestamp: str = Field(default="")
@@ -91,9 +89,7 @@ class BackendPayload(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-# =========================================================
 # 2. 에이전트 상태 정의
-# =========================================================
 class AgentState(TypedDict):
     user_id: str
     device_id: str
@@ -109,23 +105,34 @@ class AgentState(TypedDict):
     params: dict
     pill_history: List[dict]
     chat_history: List[dict]
-    last_confirmed_timestamp: str  # ✅ 중복 팝업 방지
+    last_confirmed_timestamp: str  # 중복 팝업 방지
 
-
-# =========================================================
 # 3. 모델 설정
-# =========================================================
-llm = AzureChatOpenAI(
+fast_llm = AzureChatOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     azure_deployment=settings.azure_openai_deployment_name,
     api_version=settings.azure_openai_api_version,
     api_key=settings.azure_openai_api_key,
     temperature=0.3,
-    max_tokens=500,
+    max_tokens=150,
 )
+fast_structured = fast_llm.with_structured_output(AgentResponse)
 
-structured_llm = llm.with_structured_output(AgentResponse)
+# 긴 응답용 (drug_info, check_history)
+rich_llm = AzureChatOpenAI(
+    azure_endpoint=settings.azure_openai_endpoint,
+    azure_deployment=settings.azure_openai_deployment_name,
+    api_version=settings.azure_openai_api_version,
+    api_key=settings.azure_openai_api_key,
+    temperature=0.3,
+    max_tokens=400,
+)
+rich_structured = rich_llm.with_structured_output(AgentResponse)
 
+# 기존 llm (drug_info 약 이름 추출용)
+llm = fast_llm
+
+# 의도 분류용 (기존 유지)
 intent_llm = AzureChatOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     azure_deployment=settings.azure_openai_deployment_name,
@@ -136,9 +143,7 @@ intent_llm = AzureChatOpenAI(
 ).with_structured_output(IntentClassification)
 
 
-# =========================================================
 # 4. DB 연결 함수
-# =========================================================
 async def get_user_profile(user_id: str):
     return {
         "habit_strength": "medium",
@@ -304,6 +309,9 @@ def monitor_iot_node(state: AgentState):
 
 
 def analyze_schedule_node(state: AgentState):
+    user_message = state["messages"][0] if state["messages"] else ""
+    if user_message and user_message.strip():
+        return state  # 사용자 메시지 있으면 즉시 스킵
     print("[System] 복약 스케줄 확인 중...")
     return {**state, "schedule": [{"pill_name": "비타민", "time": "13:00", "is_taken": False}]}
 
@@ -312,10 +320,28 @@ def classify_intent_node(state: AgentState):
     print("[System] 사용자 의도 분류 중...")
 
     user_message = state["messages"][-1] if state["messages"] else ""
+
+    quick_rules = [
+        (["먹었어", "먹었다", "복용했어", "응 먹었"], "COMPLETE_DOSE"),
+        (["알람 다 켜", "알람 켜줘", "모든 알람 켜"], "TOGGLE_ALL_ALARMS"),
+        (["알람 다 꺼", "알람 꺼줘", "모든 알람 꺼"], "TOGGLE_ALL_ALARMS"),
+        (["알람 다 지워", "알람 삭제", "모든 알람 삭제"], "DELETE_ALL_ALARMS"),
+        (["약 먹었", "방금 먹었"], "COMPLETE_DOSE"),
+        (["약 검색", "약 찾아줘", "검색해줘"], "SEARCH_DRUG"),
+        (["게시글 써", "후기 써줘", "올려줘", "게시판에"], "WRITE_POST"),
+        (["오늘 약", "복용 내역", "언제 안 먹"], "CHECK_HISTORY"),
+    ]
+
+    for keywords, intent in quick_rules:
+        if any(k in user_message for k in keywords):
+            print(f" -> [빠른 분류] {intent}")
+            return {**state, "intent": intent}
+
+    # 기존 코드 (IoT 체크 + LLM 분류)
     iot_data = state.get("iot_status", {})
     weight_change = iot_data.get("weight_change", 0)
 
-    # ✅ IoT 이벤트 - 이미 확인한 타임스탬프는 무시
+    # IoT 이벤트 - 이미 확인한 타임스탬프는 무시
     if abs(weight_change) > 1.0:
         timestamp_str = iot_data.get("timestamp", "")
         last_confirmed = state.get("last_confirmed_timestamp", "")
@@ -365,7 +391,7 @@ def navigate_node(state: AgentState):
         HumanMessage(content=f"사용자가 화면 이동을 원합니다. 메시지: {state['messages'][-1]}\n어떤 화면으로 이동할지 결정하고 친절하게 안내해주세요.")
     ]
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = fast_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "NAVIGATE",
                 "next_step": ai_res.target, "show_confirmation": False, "params": {}}
     except Exception as e:
@@ -393,13 +419,13 @@ def complete_dose_node(state: AgentState):
 
     return {
         **state,
-        "response_text": "복용 완료로 기록했어요! 건강 잘 챙기고 있네요 😊",
+        "response_text": "복용 완료로 기록했어요! 😊",
         "action_required": "COMPLETE_DOSE",
         "next_step": "NONE",
         "show_confirmation": False,
         "params": {"taken_at": taken_at},
         "pill_history": updated_history,
-        "last_confirmed_timestamp": iot_timestamp,  # ✅ 중복 팝업 방지
+        "last_confirmed_timestamp": iot_timestamp,  # 중복 팝업 방지
         "user_confirmed": True,
     }
 
@@ -414,7 +440,7 @@ def set_alarm_node(state: AgentState):
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = fast_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "SET_ALARM",
                 "next_step": "ALARM", "show_confirmation": False, "params": ai_res.params.model_dump()}
     except Exception as e:
@@ -474,7 +500,7 @@ def search_drug_node(state: AgentState):
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = fast_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "SEARCH_DRUG",
                 "next_step": "SEARCH_PILL", "show_confirmation": False, "params": ai_res.params.model_dump()}
     except Exception as e:
@@ -493,7 +519,7 @@ def write_post_node(state: AgentState):
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = fast_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "WRITE_POST",
                 "next_step": "WRITE_BOARD", "show_confirmation": True, "params": ai_res.params.model_dump()}
     except Exception as e:
@@ -526,7 +552,7 @@ def check_history_node(state: AgentState):
     ]
 
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = rich_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "NONE",
                 "next_step": "NONE", "show_confirmation": False, "params": {}}
     except Exception as e:
@@ -581,7 +607,7 @@ def drug_info_node(state: AgentState):
 핵심만 자연스럽게 요약해주세요.""")
             ]
 
-        ai_res = structured_llm.invoke(messages)
+        ai_res = rich_structured.invoke(messages)
         return {**state, "response_text": ai_res.reply, "action_required": "NONE",
                 "next_step": "NONE", "show_confirmation": False, "params": {}}
 
@@ -610,7 +636,7 @@ def chat_node(state: AgentState):
     ]
 
     try:
-        ai_res = structured_llm.invoke(messages)
+        ai_res = rich_structured.invoke(messages)
         print(f" -> [매디 응답]: {ai_res.reply}")
         return {**state, "response_text": ai_res.reply, "action_required": ai_res.command,
                 "next_step": ai_res.target, "show_confirmation": ai_res.show_confirmation,
@@ -642,10 +668,7 @@ def route_by_intent(state: AgentState) -> str:
     }
     return routes.get(intent, "chat")
 
-
-# =========================================================
 # 7. 그래프 구성 및 컴파일
-# =========================================================
 workflow = StateGraph(AgentState)
 
 workflow.add_node("monitor_iot", monitor_iot_node)
@@ -694,9 +717,7 @@ app = workflow.compile()
 print("✅ Maddy Agent 빌드 완료!")
 
 
-# =========================================================
 # 8. 외부 전송 함수
-# =========================================================
 def send_to_joone_fastapi(state: AgentState):
     JOONE_API_URL = "http://20.106.40.121/arduino"
     iot = state.get("iot_status", {})
@@ -730,9 +751,7 @@ def send_push_notification(user_id: str, title: str, body: str):
         print(f"(!) Push 오류: {err}")
 
 
-# =========================================================
 # 9. 메인 인터페이스 함수
-# =========================================================
 def get_medie_response(
     user_message: str,
     current_mode: str,
