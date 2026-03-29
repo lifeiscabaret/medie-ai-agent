@@ -565,20 +565,37 @@ reply는 "게시글 초안 작성했어요! 확인해보세요 😊" 로 고정.
 def post_submit_node(state: AgentState):
     print("[System] 게시글 등록 처리 중...")
     messages = [
-        SystemMessage(content="""사용자가 게시글을 바로 등록하고 싶어합니다.
-제목, 내용, 게시판 종류를 추출해서 등록 준비해주세요.
+        SystemMessage(content="""게시글 제목, 내용, 게시판 종류를 추출하세요.
 board_type: free/med_question/review/notice
-reply는 "게시글을 등록할게요! 내용을 확인해주세요 😊" 로 고정."""),
+reply는 "게시글을 등록했어요! 😊" 로 고정."""),
         HumanMessage(content=f"사용자 메시지: {state['messages'][-1]}")
     ]
     try:
         ai_res = fast_structured.invoke(messages)
-        return {**state, "response_text": ai_res.reply, "action_required": "WRITE_POST",
-                "next_step": "WRITE_BOARD", "show_confirmation": False,
-                "params": ai_res.params.model_dump()}
+        params = ai_res.params.model_dump()
+
+        # 실제 API 호출 추가
+        try:
+            requests.post("http://20.106.40.121/boards/", json={
+                "title": params.get("title", "제목"),
+                "content": params.get("content", "내용"),
+                "board_type": params.get("board_type", "free"),
+                "author": state.get("user_id", "User_01")
+            }, timeout=3)
+            print("✅ 게시글 등록 완료")
+        except Exception as e:
+            print(f"⚠️ 게시글 등록 실패: {e}")
+
+        return {**state, "response_text": ai_res.reply,
+                "action_required": "NAVIGATE",
+                "next_step": "COMMUNITY",
+                "show_confirmation": False,
+                "params": params}
     except Exception as e:
-        return {**state, "response_text": "게시글 내용을 말씀해주세요!", "action_required": "NONE",
-                "next_step": "NONE", "show_confirmation": False, "params": {}}
+        return {**state, "response_text": "게시글 내용을 말씀해주세요!",
+                "action_required": "NONE",
+                "next_step": "NONE",
+                "show_confirmation": False, "params": {}}
     
 def check_history_node(state: AgentState):
     print("[System] 복약 내역 확인 중...")
@@ -898,6 +915,7 @@ def get_medie_response(
         "pill_history": pill_history,
         "chat_history": chat_history,
         "last_confirmed_timestamp": last_confirmed_timestamp,
+        "push_token": "",  # ✅ 추가
     }
 
     final_result = app.invoke(initial_state)
