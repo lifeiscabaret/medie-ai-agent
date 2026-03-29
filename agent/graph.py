@@ -108,6 +108,7 @@ class AgentState(TypedDict):
     pill_history: List[dict]
     chat_history: List[dict]
     last_confirmed_timestamp: str  # 중복 팝업 방지
+    push_token: str  # ← 추가
 
 # 3. 모델 설정
 fast_llm = AzureChatOpenAI(
