@@ -140,7 +140,7 @@ intent_llm = AzureChatOpenAI(
     api_version=settings.azure_openai_api_version,
     api_key=settings.azure_openai_api_key,
     temperature=0.1,
-    max_tokens=50,
+    max_tokens=80,
 ).with_structured_output(IntentClassification)
 
 
@@ -432,13 +432,34 @@ def complete_dose_node(state: AgentState):
     current_history = state.get("pill_history", [])
     updated_history = current_history + [new_record]
 
+    # ✅ 패턴 분석
+    pattern = analyze_pill_pattern(updated_history)
+    
+    if pattern and pattern.get("suggest"):
+        avg_time = pattern["avg_time"]
+        count = pattern["sample_count"]
+        reply = (
+            f"복용 완료로 기록했어요! 😊 "
+            f"최근 {count}회 복약 기록을 보니 "
+            f"평균 {avg_time}에 드시네요. "
+            f"알람을 {avg_time}으로 변경해드릴까요?"
+        )
+        # 알람 변경 제안
+        action = "SET_ALARM"
+        params = {"time": avg_time, "pillId": "all"}
+        print(f"[패턴 감지] 평균 복약 시간 {avg_time} → 알람 변경 제안")
+    else:
+        reply = "복용 완료로 기록했어요! 😊"
+        action = "COMPLETE_DOSE"
+        params = {"taken_at": taken_at}
+
     return {
         **state,
-        "response_text": "복용 완료로 기록했어요! 😊",
-        "action_required": "COMPLETE_DOSE",
+        "response_text": reply,
+        "action_required": action,
         "next_step": "NONE",
         "show_confirmation": False,
-        "params": {"taken_at": taken_at},
+        "params": params,
         "pill_history": updated_history,
         "last_confirmed_timestamp": iot_timestamp,
         "user_confirmed": True,
@@ -661,10 +682,61 @@ def drug_info_node(state: AgentState):
         return {**state, "response_text": "약 정보를 가져오는 중 오류가 발생했어요!",
                 "action_required": "NONE", "next_step": "NONE",
                 "show_confirmation": False, "params": {}}
+    
+# =========================================================
+# 복약 패턴 분석 함수
+# =========================================================
+def analyze_pill_pattern(pill_history: list) -> dict:
+    """최근 복약 이력에서 평균 복약 시간 계산"""
+    if not pill_history or len(pill_history) < 3:
+        return {}  # 데이터 3개 이상부터 분석
+
+    try:
+        # 최근 5회 복약 시간 추출
+        recent = [
+            h for h in pill_history
+            if h.get("taken") and h.get("time")
+        ][-5:]
+
+        if len(recent) < 3:
+            return {}
+
+        # 평균 시간 계산
+        total_minutes = 0
+        for record in recent:
+            t = record["time"]  # "08:32" 형식
+            h, m = map(int, t.split(":"))
+            total_minutes += h * 60 + m
+
+        avg_minutes = total_minutes // len(recent)
+        avg_hour = avg_minutes // 60
+        avg_min = avg_minutes % 60
+        avg_time = f"{avg_hour:02d}:{avg_min:02d}"
+
+        print(f"[패턴 분석] 최근 {len(recent)}회 평균 복약 시간: {avg_time}")
+
+        return {
+            "avg_time": avg_time,
+            "sample_count": len(recent),
+            "suggest": True
+        }
+    except Exception as e:
+        print(f"(!) 패턴 분석 실패: {e}")
+        return {}    
 
 
 def chat_node(state: AgentState):
     print("[System] 일반 대화 처리 중...")
+
+    # ✅ 메시지 없으면 바로 리턴
+    if not state.get("messages"):
+        return {**state, "response_text": "", "action_required": "NONE",
+                "next_step": "IDLE", "show_confirmation": False, "params": {}}
+
+    user_message = state['messages'][-1]
+    if not user_message or not user_message.strip():
+        return {**state, "response_text": "", "action_required": "NONE",
+                "next_step": "IDLE", "show_confirmation": False, "params": {}}
 
     chat_history = state.get("chat_history", [])
     history_messages = []
