@@ -57,3 +57,7 @@ def check_pill_weight_status(device_id: str, threshold: float = 2.0) -> Dict[str
 def get_pill_weight_tool():
     from langchain.tools import Tool
     return Tool(
+        name="check_pill_weight",
+        func=check_pill_weight_status,
+        description="사용자의 약통 무게 변화를 체크하여 약을 먹었는지 감지할 때 사용합니다."
+    )

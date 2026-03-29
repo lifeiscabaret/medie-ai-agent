@@ -5,8 +5,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import requests
+from datetime import datetime, timedelta, timezone
 
 from agent.graph import app as medie_graph, get_medie_response, send_to_joone_fastapi, MedicationData
+
+# ✅ Push Token 저장소
+push_tokens = {}
+
+# ✅ 알람 시간 저장소
+alarm_times = {"User_01": "08:00"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,9 +35,29 @@ app.add_middleware(
 
 app.include_router(tts.router)
 
+
+# ✅ Push 알림 전송 함수
+def send_expo_push(user_id: str, title: str, body: str):
+    token = push_tokens.get(user_id)
+    if not token:
+        print(f"⚠️ Push Token 없음: {user_id}")
+        return
+    try:
+        requests.post("https://exp.host/--/api/v2/push/send", json={
+            "to": token,
+            "title": title,
+            "body": body,
+            "sound": "default"
+        }, timeout=5)
+        print(f"✅ 푸시 알림 전송 완료: {user_id}")
+    except Exception as e:
+        print(f"⚠️ 푸시 알림 실패: {e}")
+
+
 def background_monitoring():
     print("🚀 [System] 실시간 IoT 확인 스레드 시작")
     last_processed_time = ""
+    last_alarm_sent = ""  # ✅ 중복 알림 방지
 
     initial_state = {
         "user_id": "SYSTEM_MONITOR",
@@ -44,22 +72,40 @@ def background_monitoring():
         "user_confirmed": False,
         "show_confirmation": False,
         "params": {},
-        "pill_history": [],  # ← 추가
-        "chat_history": [],           # ← 추가
-        "last_confirmed_timestamp": ""  # ← 추가
+        "pill_history": [],
+        "chat_history": [],
+        "last_confirmed_timestamp": ""
     }
 
     while True:
         try:
+            # ✅ 알람 시간 체크 + 푸시 알림
+            kst = timezone(timedelta(hours=9))
+            now = datetime.now(kst)
+            current_time = now.strftime('%H:%M')
+
+            for user_id, alarm_time in alarm_times.items():
+                alarm_key = f"{user_id}_{alarm_time}_{now.strftime('%Y-%m-%d')}"
+                if current_time == alarm_time and alarm_key != last_alarm_sent:
+                    print(f"⏰ [Alarm] {user_id} 복약 시간 알림!")
+                    send_expo_push(
+                        user_id,
+                        "💊 복약 시간이에요!",
+                        "매디가 알려드려요. 지금 약 드실 시간이에요!"
+                    )
+                    last_alarm_sent = alarm_key
+
+            # ✅ IoT 모니터링
             final_state = medie_graph.invoke(initial_state)
             iot_data = final_state.get("iot_status", {})
-            current_time = iot_data.get("timestamp", "") if isinstance(iot_data, dict) else ""
+            current_iot_time = iot_data.get("timestamp", "") if isinstance(iot_data, dict) else ""
 
-            if current_time and current_time != last_processed_time:
+            if current_iot_time and current_iot_time != last_processed_time:
                 print(f"🔔 [Background] 새 데이터 확인! 분석 중...")
                 if final_state.get("next_step") != "IDLE":
                     send_to_joone_fastapi(final_state)
-                last_processed_time = current_time
+                last_processed_time = current_iot_time
+
         except Exception as err:
             print(f"⚠️ [Background Error]: {err}")
 
@@ -72,7 +118,32 @@ class ChatRequest(BaseModel):
     user_id: str = "User_01"
     pill_history: list = []
     chat_history: list = []
-    last_confirmed_timestamp: str = ""  # ← 추가
+    last_confirmed_timestamp: str = ""
+
+
+# ✅ Push Token 저장 엔드포인트
+class PushTokenRequest(BaseModel):
+    user_id: str
+    token: str
+
+@app.post("/push-token")
+async def save_push_token(req: PushTokenRequest):
+    push_tokens[req.user_id] = req.token
+    print(f"✅ Push Token 저장: {req.user_id} / {req.token[:20]}...")
+    return {"status": "ok"}
+
+
+# ✅ 알람 시간 저장 엔드포인트
+class AlarmTimeRequest(BaseModel):
+    user_id: str
+    alarm_time: str  # "08:00" 형식
+
+@app.post("/alarm-time")
+async def save_alarm_time(req: AlarmTimeRequest):
+    alarm_times[req.user_id] = req.alarm_time
+    print(f"✅ 알람 시간 저장: {req.user_id} / {req.alarm_time}")
+    return {"status": "ok"}
+
 
 @app.get("/health")
 async def health_check():
@@ -127,9 +198,9 @@ async def webhook_weight_log(data: MedicationData):
         "user_confirmed": False,
         "show_confirmation": False,
         "params": {},
-        "pill_history": [],  # ← 추가
-        "chat_history": [],              # ← 추가
-        "last_confirmed_timestamp": ""   # ← 추가
+        "pill_history": [],
+        "chat_history": [],
+        "last_confirmed_timestamp": ""
     }
 
     final_result = medie_graph.invoke(event_state)
