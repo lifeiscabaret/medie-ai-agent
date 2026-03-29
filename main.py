@@ -144,6 +144,11 @@ async def save_alarm_time(req: AlarmTimeRequest):
     print(f"✅ 알람 시간 저장: {req.user_id} / {req.alarm_time}")
     return {"status": "ok"}
 
+@app.get("/alarm-time/{user_id}")
+async def get_alarm_time(user_id: str):
+    alarm_time = alarm_times.get(user_id, "08:00")
+    return {"alarm_time": alarm_time}
+
 
 @app.get("/health")
 async def health_check():
