@@ -47,7 +47,8 @@ def send_expo_push(user_id: str, title: str, body: str):
             "to": token,
             "title": title,
             "body": body,
-            "sound": "default"
+            "sound": "default",
+            "priority": "high"
         }, timeout=5)
         print(f"✅ 푸시 알림 전송 완료: {user_id}")
     except Exception as e:
@@ -57,7 +58,7 @@ def send_expo_push(user_id: str, title: str, body: str):
 def background_monitoring():
     print("🚀 [System] 실시간 IoT 확인 스레드 시작")
     last_processed_time = ""
-    last_alarm_sent = ""  # ✅ 중복 알림 방지
+    last_alarm_sent = ""
 
     initial_state = {
         "user_id": "SYSTEM_MONITOR",
@@ -74,16 +75,17 @@ def background_monitoring():
         "params": {},
         "pill_history": [],
         "chat_history": [],
-        "last_confirmed_timestamp": ""
+        "last_confirmed_timestamp": "",
+        "push_token": "",
     }
 
     while True:
         try:
-            # ✅ 알람 시간 체크 + 푸시 알림
             kst = timezone(timedelta(hours=9))
             now = datetime.now(kst)
             current_time = now.strftime('%H:%M')
 
+            # ✅ 알람 시간 체크 → 푸시 알림
             for user_id, alarm_time in alarm_times.items():
                 alarm_key = f"{user_id}_{alarm_time}_{now.strftime('%Y-%m-%d')}"
                 if current_time == alarm_time and alarm_key != last_alarm_sent:
@@ -121,7 +123,6 @@ class ChatRequest(BaseModel):
     last_confirmed_timestamp: str = ""
 
 
-# ✅ Push Token 저장 엔드포인트
 class PushTokenRequest(BaseModel):
     user_id: str
     token: str
@@ -133,10 +134,9 @@ async def save_push_token(req: PushTokenRequest):
     return {"status": "ok"}
 
 
-# ✅ 알람 시간 저장 엔드포인트
 class AlarmTimeRequest(BaseModel):
     user_id: str
-    alarm_time: str  # "08:00" 형식
+    alarm_time: str
 
 @app.post("/alarm-time")
 async def save_alarm_time(req: AlarmTimeRequest):
@@ -170,6 +170,20 @@ async def chat_endpoint(req: ChatRequest):
             req.chat_history,
             req.last_confirmed_timestamp
         )
+
+        # ✅ LangGraph가 패턴 분석으로 SET_ALARM 제안하면 서버 alarm_times도 업데이트
+        if result.get("command") == "SET_ALARM":
+            new_time = result.get("params", {}).get("time")
+            if new_time:
+                alarm_times[req.user_id] = new_time
+                print(f"✅ 패턴 분석 → 알람 시간 자동 업데이트: {req.user_id} / {new_time}")
+                # ✅ 즉시 푸시 알림으로 알람 변경 알려주기
+                send_expo_push(
+                    req.user_id,
+                    "⏰ 알람 시간이 변경됐어요!",
+                    f"복약 패턴 분석 결과 {new_time}으로 알람을 맞춰드렸어요!"
+                )
+
         return {
             "reply": result.get("reply"),
             "command": result.get("command"),
@@ -192,11 +206,18 @@ async def chat_endpoint(req: ChatRequest):
 
 @app.post("/webhook/weight-log")
 async def webhook_weight_log(data: MedicationData):
-    """IoT 즉각 감지 Webhook"""
     print(f"🔔 [Webhook] 즉각 감지! 기기: {data.device_id}")
 
+    # ✅ webhook으로 무게 감지되면 즉시 푸시 알림
+    user_id = data.user_id if data.user_id != "Unknown" else "User_01"
+    send_expo_push(
+        user_id,
+        "💊 약통 움직임 감지!",
+        "방금 약 드셨나요? 매디에게 알려주세요!"
+    )
+
     event_state = {
-        "user_id": "SYSTEM_TRIGGER",
+        "user_id": user_id,
         "device_id": data.device_id,
         "iot_status": data.model_dump(),
         "schedule": [],
@@ -210,7 +231,8 @@ async def webhook_weight_log(data: MedicationData):
         "params": {},
         "pill_history": [],
         "chat_history": [],
-        "last_confirmed_timestamp": ""
+        "last_confirmed_timestamp": "",
+        "push_token": push_tokens.get(user_id, ""),  # ✅ push_token 전달
     }
 
     final_result = medie_graph.invoke(event_state)
