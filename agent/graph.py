@@ -22,6 +22,7 @@ from agent.prompts import SYSTEM_PROMPT
 # 1. Pydantic 스키마 정의
 class MedicationData(BaseModel):
     device_id: str = Field(default="Unknown", alias="deviceId")
+    user_id: str = Field(default="Unknown", alias="userId")  # user_id 추가
     timestamp: str = Field(default="")
     morning: bool = Field(default=False)
     lunch: bool = Field(default=False)
