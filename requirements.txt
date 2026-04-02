@@ -9,3 +9,5 @@ langgraph
 langchain-openai
 httpx
 azure-storage-blob
+chromadb
+langchain-community
